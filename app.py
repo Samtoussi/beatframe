@@ -1,12 +1,14 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QSettings
 from PySide6.QtWidgets import (
     QApplication,
     QLabel,
     QMainWindow,
     QProgressBar,
+    QPushButton,
+    QFileDialog,
     QVBoxLayout,
     QWidget,
 )
@@ -57,8 +59,25 @@ class BeatFrame(QMainWindow):
         self.resize(600, 400)
         self.setAcceptDrops(True)
 
+        self.settings = QSettings("BeatFrame", "BeatFrame")
+
+        default_output = str(Path.home() / "Desktop")
+
+        self.output_dir = self.settings.value(
+            "output_dir",
+            default_output,
+        )
+
         self.label = QLabel("Drop your artwork + beat here")
         self.label.setAlignment(Qt.AlignCenter)
+
+        self.output_label = QLabel(
+            f"Output: {self.output_dir}"
+        )
+        self.output_label.setAlignment(Qt.AlignCenter)
+
+        self.output_button = QPushButton("Choose output folder")
+        self.output_button.clicked.connect(self.choose_output_folder)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -68,6 +87,8 @@ class BeatFrame(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addWidget(self.label)
+        layout.addWidget(self.output_label)
+        layout.addWidget(self.output_button)
         layout.addWidget(self.progress_bar)
 
         container = QWidget()
@@ -77,12 +98,40 @@ class BeatFrame(QMainWindow):
 
         self.thread = None
         self.worker = None
+        self.is_rendering = False
+
+    def choose_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose output folder",
+            self.output_dir,
+        )
+
+        if not folder:
+            return
+
+        self.output_dir = folder
+
+        self.settings.setValue(
+            "output_dir",
+            self.output_dir,
+        )
+
+        self.output_label.setText(
+            f"Output: {self.output_dir}"
+        )
 
     def dragEnterEvent(self, event):
+        if self.is_rendering:
+            return
+
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
     def dropEvent(self, event):
+        if self.is_rendering:
+            return
+
         files = [
             Path(url.toLocalFile())
             for url in event.mimeData().urls()
@@ -108,7 +157,9 @@ class BeatFrame(QMainWindow):
         )
 
         if not audio or not artwork:
-            self.label.setText("Drop one WAV + one JPG/PNG")
+            self.label.setText(
+                "Drop one WAV + one JPG/PNG"
+            )
             return
 
         self.label.setText(
@@ -120,12 +171,13 @@ class BeatFrame(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.show()
 
-        output_dir = str(Path.home() / "Desktop")
+        self.output_button.setEnabled(False)
+        self.is_rendering = True
 
         self.start_render(
             image_path=str(artwork),
             audio_path=str(audio),
-            output_dir=output_dir,
+            output_dir=self.output_dir,
         )
 
     def start_render(
@@ -168,8 +220,11 @@ class BeatFrame(QMainWindow):
         self.label.setText(
             f"✓ Done\n\n"
             f"{Path(output_path).name}\n\n"
-            "Saved to Desktop"
+            f"Saved to:\n{self.output_dir}"
         )
+
+        self.output_button.setEnabled(True)
+        self.is_rendering = False
 
     def render_failed(self, error: str):
         self.progress_bar.hide()
@@ -177,6 +232,9 @@ class BeatFrame(QMainWindow):
         self.label.setText(
             f"Render failed:\n\n{error}"
         )
+
+        self.output_button.setEnabled(True)
+        self.is_rendering = False
 
 
 app = QApplication(sys.argv)
