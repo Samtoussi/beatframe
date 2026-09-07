@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import subprocess
+from typing import Callable, Optional
 
 
 def get_audio_duration(audio_path: str) -> float:
@@ -28,6 +29,7 @@ def render_video(
     audio_path: str,
     output_dir: str,
     fade_duration: float = 6.5,
+    progress_callback: Optional[Callable[[float], None]] = None,
 ) -> Path:
     image = Path(image_path)
     audio = Path(audio_path)
@@ -57,9 +59,39 @@ def render_video(
         "-b:a", "320k",
         "-pix_fmt", "yuv420p",
         "-shortest",
+        "-progress", "pipe:1",
+        "-nostats",
         str(output_path),
     ]
 
-    subprocess.run(command, check=True)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+    if process.stdout is None:
+        raise RuntimeError("Could not read FFmpeg progress output.")
+
+    for line in process.stdout:
+        line = line.strip()
+
+        if line.startswith("out_time_ms="):
+            out_time_us = int(line.split("=", 1)[1])
+            current_seconds = out_time_us / 1_000_000
+
+            progress = min(current_seconds / audio_duration, 1.0)
+
+            if progress_callback:
+                progress_callback(progress)
+
+    return_code = process.wait()
+
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, command)
+
+    if progress_callback:
+        progress_callback(1.0)
 
     return output_path
