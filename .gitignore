@@ -1,0 +1,14 @@
+# BeatFrame input/output media
+*.wav
+*.mp3
+*.mp4
+*.jpg
+*.jpeg
+*.png
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
