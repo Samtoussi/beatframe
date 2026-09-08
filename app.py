@@ -81,7 +81,7 @@ class SettingsDialog(QDialog):
 
         self.setWindowTitle("BeatFrame Settings")
         self.setModal(True)
-        self.resize(520, 320)
+        self.resize(520, 370)
 
         self.build_ui()
         self.load_settings()
@@ -150,6 +150,10 @@ class SettingsDialog(QDialog):
         self.fade_spinbox.setSingleStep(0.5)
         self.fade_spinbox.setSuffix(" s")
 
+        self.auto_render_checkbox = QCheckBox(
+            "Render automatically after drop"
+        )
+
         form.addRow(
             "Output folder",
             self.output_button,
@@ -168,6 +172,11 @@ class SettingsDialog(QDialog):
         form.addRow(
             "Visual fade",
             self.fade_spinbox,
+        )
+
+        form.addRow(
+            "Workflow",
+            self.auto_render_checkbox,
         )
 
         main_layout.addLayout(form)
@@ -212,18 +221,22 @@ class SettingsDialog(QDialog):
             "",
         )
 
-        intro_enabled_value = (
-            self.settings.value(
-                "intro_enabled",
-                bool(self.intro_path),
-                type=bool,
-            )
+        intro_enabled_value = self.settings.value(
+            "intro_enabled",
+            bool(self.intro_path),
+            type=bool,
         )
 
         fade_duration = self.settings.value(
             "fade_duration",
             6.5,
             type=float,
+        )
+
+        auto_render = self.settings.value(
+            "auto_render",
+            True,
+            type=bool,
         )
 
         self.output_button.setText(
@@ -236,6 +249,10 @@ class SettingsDialog(QDialog):
 
         self.fade_spinbox.setValue(
             fade_duration
+        )
+
+        self.auto_render_checkbox.setChecked(
+            auto_render
         )
 
         self.update_intro_button_text()
@@ -323,6 +340,11 @@ class SettingsDialog(QDialog):
             self.fade_spinbox.value(),
         )
 
+        self.settings.setValue(
+            "auto_render",
+            self.auto_render_checkbox.isChecked(),
+        )
+
         self.accept()
 
     def apply_styles(self):
@@ -403,6 +425,9 @@ class BeatFrame(QMainWindow):
         self.thread = None
         self.worker = None
         self.is_rendering = False
+
+        self.pending_audio = None
+        self.pending_artwork = None
 
         self.build_ui()
         self.apply_styles()
@@ -516,6 +541,17 @@ class BeatFrame(QMainWindow):
         self.progress_bar.setTextVisible(True)
         self.progress_bar.hide()
 
+        self.render_button = QPushButton(
+            "Render"
+        )
+        self.render_button.setObjectName(
+            "renderButton"
+        )
+        self.render_button.clicked.connect(
+            self.render_pending_files
+        )
+        self.render_button.hide()
+
         drop_layout.addStretch()
         drop_layout.addWidget(
             self.status_icon
@@ -529,6 +565,10 @@ class BeatFrame(QMainWindow):
         drop_layout.addSpacing(14)
         drop_layout.addWidget(
             self.progress_bar
+        )
+        drop_layout.addWidget(
+            self.render_button,
+            alignment=Qt.AlignCenter,
         )
         drop_layout.addStretch()
 
@@ -627,6 +667,20 @@ class BeatFrame(QMainWindow):
                 background-color: #23262c;
             }
 
+            QPushButton#renderButton {
+                background-color: #ffffff;
+                color: #111214;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 28px;
+                font-weight: 700;
+                min-width: 100px;
+            }
+
+            QPushButton#renderButton:hover {
+                background-color: #dedede;
+            }
+
             QPushButton:disabled {
                 color: #5f636c;
                 background-color: #1d1f23;
@@ -681,6 +735,12 @@ class BeatFrame(QMainWindow):
             len(audio_files) != 1
             or len(image_files) != 1
         ):
+            self.pending_audio = None
+            self.pending_artwork = None
+
+            self.progress_bar.hide()
+            self.render_button.hide()
+
             self.status_icon.setText("!")
             self.main_label.setText(
                 "Drop exactly one WAV + one image"
@@ -690,8 +750,48 @@ class BeatFrame(QMainWindow):
             )
             return
 
-        audio = audio_files[0]
-        artwork = image_files[0]
+        self.pending_audio = audio_files[0]
+        self.pending_artwork = image_files[0]
+
+        auto_render = self.settings.value(
+            "auto_render",
+            True,
+            type=bool,
+        )
+
+        if auto_render:
+            self.render_pending_files()
+        else:
+            self.show_files_ready()
+
+    def show_files_ready(self):
+        if (
+            self.pending_audio is None
+            or self.pending_artwork is None
+        ):
+            return
+
+        self.progress_bar.hide()
+
+        self.status_icon.setText("✓")
+        self.main_label.setText("Files ready")
+        self.detail_label.setText(
+            f"{self.pending_audio.name}  +  "
+            f"{self.pending_artwork.name}"
+        )
+
+        self.render_button.show()
+
+    def render_pending_files(self):
+        if (
+            self.pending_audio is None
+            or self.pending_artwork is None
+            or self.is_rendering
+        ):
+            return
+
+        audio = self.pending_audio
+        artwork = self.pending_artwork
 
         default_output = str(
             Path.home() / "Desktop"
@@ -719,16 +819,15 @@ class BeatFrame(QMainWindow):
             "",
         )
 
-        if (
-            intro_enabled
-            and intro_path
-        ):
+        if intro_enabled and intro_path:
             active_intro = intro_path
         else:
             active_intro = None
 
         self.is_rendering = True
+
         self.settings_button.setEnabled(False)
+        self.render_button.hide()
 
         self.status_icon.setText("●")
         self.main_label.setText(
@@ -829,6 +928,9 @@ class BeatFrame(QMainWindow):
             Path(output_path).name
         )
 
+        self.pending_audio = None
+        self.pending_artwork = None
+
         self.is_rendering = False
         self.settings_button.setEnabled(
             True
@@ -852,6 +954,12 @@ class BeatFrame(QMainWindow):
         self.settings_button.setEnabled(
             True
         )
+
+        if (
+            self.pending_audio is not None
+            and self.pending_artwork is not None
+        ):
+            self.render_button.show()
 
 
 app = QApplication(sys.argv)
