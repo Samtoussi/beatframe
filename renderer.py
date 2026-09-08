@@ -240,6 +240,7 @@ def render_main_video(
         "-ar", "48000",
         "-ac", "2",
         "-pix_fmt", "yuv420p",
+        "-t", str(audio_duration),
         "-shortest",
         "-progress", "pipe:1",
         "-nostats",
