@@ -2,6 +2,7 @@ import sys
 import subprocess
 from pathlib import Path
 from typing import Optional
+from dataclasses import dataclass
 
 from PySide6.QtCore import (
     Qt,
@@ -12,6 +13,8 @@ from PySide6.QtCore import (
     QSize,
     QTimer,
     QPointF,
+    QPropertyAnimation,
+    QEasingCurve,
 )
 from PySide6.QtGui import (
     QIcon,
@@ -42,6 +45,8 @@ from PySide6.QtWidgets import (
     QWidget,
     QGraphicsDropShadowEffect,
     QGraphicsBlurEffect,
+    QGraphicsOpacityEffect,
+    QScrollArea,
 )
 
 import renderer as renderer_module
@@ -89,6 +94,175 @@ KNOWN_IMAGE_EXTENSIONS = {
     ".tiff",
     ".tif",
 }
+
+
+class WindowsTaskbarProgress:
+    """Native Windows taskbar progress. No-op on macOS/Linux."""
+
+    TBPF_NOPROGRESS = 0x0
+    TBPF_INDETERMINATE = 0x1
+    TBPF_NORMAL = 0x2
+    TBPF_ERROR = 0x4
+    TBPF_PAUSED = 0x8
+
+    def __init__(self, window):
+        self._window = window
+        self._taskbar = None
+
+        if sys.platform != "win32":
+            return
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            HRESULT = ctypes.c_long
+            ULONG = ctypes.c_ulong
+            ULONGLONG = ctypes.c_ulonglong
+            HWND = wintypes.HWND
+
+            class GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", ctypes.c_ulong),
+                    ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+            def guid(value):
+                import uuid
+
+                raw = uuid.UUID(value).bytes_le
+                result = GUID()
+                ctypes.memmove(
+                    ctypes.byref(result),
+                    raw,
+                    ctypes.sizeof(result),
+                )
+                return result
+
+            class ITaskbarList3:
+                def __init__(self, pointer):
+                    self.pointer = pointer
+                    vtable = ctypes.cast(
+                        pointer,
+                        ctypes.POINTER(
+                            ctypes.POINTER(ctypes.c_void_p)
+                        ),
+                    ).contents
+
+                    self.Release = ctypes.WINFUNCTYPE(
+                        ULONG,
+                        ctypes.c_void_p,
+                    )(vtable[2])
+
+                    self.HrInit = ctypes.WINFUNCTYPE(
+                        HRESULT,
+                        ctypes.c_void_p,
+                    )(vtable[3])
+
+                    self.SetProgressValue = ctypes.WINFUNCTYPE(
+                        HRESULT,
+                        ctypes.c_void_p,
+                        HWND,
+                        ULONGLONG,
+                        ULONGLONG,
+                    )(vtable[9])
+
+                    self.SetProgressState = ctypes.WINFUNCTYPE(
+                        HRESULT,
+                        ctypes.c_void_p,
+                        HWND,
+                        ctypes.c_int,
+                    )(vtable[10])
+
+            CLSID_TaskbarList = guid(
+                "56FDF344-FD6D-11D0-958A-006097C9A090"
+            )
+            IID_ITaskbarList3 = guid(
+                "EA1AFB91-9E28-4B86-90E9-9E9F8A5EEA84"
+            )
+
+            pointer = ctypes.c_void_p()
+            ole32 = ctypes.windll.ole32
+            ole32.CoInitialize(None)
+
+            result = ole32.CoCreateInstance(
+                ctypes.byref(CLSID_TaskbarList),
+                None,
+                1,
+                ctypes.byref(IID_ITaskbarList3),
+                ctypes.byref(pointer),
+            )
+
+            if result != 0 or not pointer.value:
+                return
+
+            taskbar = ITaskbarList3(pointer)
+            if taskbar.HrInit(pointer) != 0:
+                taskbar.Release(pointer)
+                return
+
+            self._taskbar = taskbar
+            self._pointer = pointer
+
+        except Exception:
+            self._taskbar = None
+
+    def _hwnd(self):
+        return int(self._window.winId())
+
+    def set_progress(self, percent: int):
+        if self._taskbar is None:
+            return
+
+        try:
+            percent = max(0, min(100, int(percent)))
+            self._taskbar.SetProgressState(
+                self._pointer,
+                self._hwnd(),
+                self.TBPF_NORMAL,
+            )
+            self._taskbar.SetProgressValue(
+                self._pointer,
+                self._hwnd(),
+                percent,
+                100,
+            )
+        except Exception:
+            pass
+
+    def set_error(self):
+        if self._taskbar is None:
+            return
+
+        try:
+            self._taskbar.SetProgressState(
+                self._pointer,
+                self._hwnd(),
+                self.TBPF_ERROR,
+            )
+            self._taskbar.SetProgressValue(
+                self._pointer,
+                self._hwnd(),
+                100,
+                100,
+            )
+        except Exception:
+            pass
+
+    def clear(self):
+        if self._taskbar is None:
+            return
+
+        try:
+            self._taskbar.SetProgressState(
+                self._pointer,
+                self._hwnd(),
+                self.TBPF_NOPROGRESS,
+            )
+        except Exception:
+            pass
 
 
 def apply_windows_dark_title_bar(window):
@@ -325,6 +499,22 @@ class ElidedLabel(QLabel):
             available,
         )
         QLabel.setText(self, text)
+
+
+class ClickableLabel(QLabel):
+    clicked = Signal()
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+
+        super().mouseReleaseEvent(event)
 
 
 class ToggleSwitch(QCheckBox):
@@ -801,6 +991,248 @@ class StatusIcon(QWidget):
             )
 
 
+
+class QueueCard(QFrame):
+    remove_requested = Signal(int)
+
+    def __init__(self, job_id: int, title: str, artwork_name: str, parent=None):
+        super().__init__(parent)
+        self.job_id = job_id
+        self.setObjectName("queueCard")
+        self.setFixedHeight(72)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(13, 10, 13, 10)
+        layout.setSpacing(5)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(8)
+
+        self.title_label = ElidedLabel(title)
+        self.title_label.setObjectName("queueCardTitle")
+
+        self.status_label = QLabel("Queued")
+        self.status_label.setObjectName("queueCardStatus")
+        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.status_label.setFixedWidth(58)
+
+        self.remove_button = QPushButton("×")
+        self.remove_button.setObjectName("queueRemoveButton")
+        self.remove_button.setFixedSize(24, 24)
+        self.remove_button.setCursor(Qt.PointingHandCursor)
+        self.remove_button.setToolTip("Remove from queue")
+        self.remove_button.clicked.connect(
+            lambda: self.remove_requested.emit(self.job_id)
+        )
+
+        top.addWidget(self.title_label, 1)
+        top.addWidget(self.status_label)
+        top.addWidget(self.remove_button)
+
+        self.detail_label = ElidedLabel(artwork_name)
+        self.detail_label.setObjectName("queueCardDetail")
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("queueCardProgress")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.hide()
+
+        layout.addLayout(top)
+        layout.addWidget(self.detail_label)
+        layout.addWidget(self.progress_bar)
+
+        self.setStyleSheet(
+            """
+            QFrame#queueCard {
+                background-color: rgba(255, 255, 255, 7);
+                border: 1px solid rgba(162, 171, 255, 38);
+                border-radius: 12px;
+            }
+            QLabel#queueCardTitle {
+                color: #F4F5FF;
+                font-size: 12px;
+                font-weight: 650;
+            }
+            QLabel#queueCardStatus {
+                color: #8792B3;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QLabel#queueCardDetail {
+                color: #74809F;
+                font-size: 10px;
+            }
+
+            QPushButton#queueRemoveButton {
+                background: transparent;
+                border: none;
+                color: #7883A4;
+                font-size: 17px;
+                font-weight: 500;
+                padding: 0px;
+            }
+
+            QPushButton#queueRemoveButton:hover {
+                color: #E798E4;
+                background-color: rgba(224, 82, 207, 14);
+                border-radius: 12px;
+            }
+
+            QProgressBar#queueCardProgress {
+                min-height: 5px;
+                max-height: 5px;
+                border: none;
+                border-radius: 2px;
+                background-color: rgba(255, 255, 255, 10);
+            }
+            QProgressBar#queueCardProgress::chunk {
+                border-radius: 2px;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #4E8DFF,
+                    stop: 0.52 #7474FF,
+                    stop: 1 #E052CF
+                );
+            }
+            """
+        )
+
+    def set_queued(self):
+        self.status_label.setText("Queued")
+        self.status_label.setStyleSheet("color: #8792B3;")
+        self.remove_button.show()
+        self.progress_bar.hide()
+        self.progress_bar.setValue(0)
+
+    def set_rendering(self, percent: int = 0):
+        percent = max(0, min(100, int(percent)))
+        self.status_label.setText(f"{percent}%")
+        self.status_label.setStyleSheet("color: #BFA8FF;")
+        self.remove_button.hide()
+        self.progress_bar.setValue(percent)
+        self.progress_bar.show()
+
+    def set_failed(self):
+        self.status_label.setText("Failed")
+        self.status_label.setStyleSheet("color: #E798E4;")
+        self.remove_button.hide()
+        self.progress_bar.hide()
+
+
+class SuccessToast(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setObjectName("successToast")
+        self.setFixedSize(310, 76)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.hide()
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
+
+        check = QLabel("✓")
+        check.setObjectName("toastCheck")
+        check.setFixedWidth(24)
+        check.setAlignment(Qt.AlignCenter)
+
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(1)
+
+        self.title_label = ElidedLabel()
+        self.title_label.setObjectName("toastTitle")
+
+        subtitle = QLabel("Rendered successfully")
+        subtitle.setObjectName("toastSubtitle")
+
+        text_layout.addWidget(self.title_label)
+        text_layout.addWidget(subtitle)
+
+        layout.addWidget(check)
+        layout.addLayout(text_layout, 1)
+
+        self.opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self.opacity_effect)
+        self.opacity_effect.setOpacity(0.0)
+
+        self.fade_in = QPropertyAnimation(
+            self.opacity_effect,
+            b"opacity",
+            self,
+        )
+        self.fade_in.setDuration(180)
+        self.fade_in.setStartValue(0.0)
+        self.fade_in.setEndValue(1.0)
+        self.fade_in.setEasingCurve(QEasingCurve.OutCubic)
+
+        self.fade_out = QPropertyAnimation(
+            self.opacity_effect,
+            b"opacity",
+            self,
+        )
+        self.fade_out.setDuration(280)
+        self.fade_out.setStartValue(1.0)
+        self.fade_out.setEndValue(0.0)
+        self.fade_out.setEasingCurve(QEasingCurve.InCubic)
+        self.fade_out.finished.connect(self.hide)
+
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self._begin_fade_out)
+
+        self.setStyleSheet(
+            """
+            QFrame#successToast {
+                background-color: rgba(12, 18, 42, 245);
+                border: 1px solid rgba(135, 214, 177, 105);
+                border-radius: 15px;
+            }
+
+            QLabel#toastCheck {
+                color: #8FE0B7;
+                font-size: 22px;
+                font-weight: 700;
+            }
+
+            QLabel#toastTitle {
+                color: #FFFFFF;
+                font-size: 13px;
+                font-weight: 650;
+            }
+
+            QLabel#toastSubtitle {
+                color: #9EABC9;
+                font-size: 11px;
+            }
+            """
+        )
+
+    def show_message(self, title: str):
+        self.hide_timer.stop()
+        self.fade_in.stop()
+        self.fade_out.stop()
+
+        self.title_label.setText(title)
+        self.opacity_effect.setOpacity(0.0)
+        self.show()
+        self.raise_()
+        self.fade_in.start()
+        self.hide_timer.start(2500)
+
+    def _begin_fade_out(self):
+        self.fade_in.stop()
+        self.fade_out.stop()
+        self.fade_out.setStartValue(
+            self.opacity_effect.opacity()
+        )
+        self.fade_out.start()
+
+
 class RenderCancelled(Exception):
     pass
 
@@ -1250,6 +1682,42 @@ class SettingsDialog(QDialog):
         self.fade_spinbox.setSingleStep(0.1)
         self.fade_spinbox.setSuffix(" s")
         self.fade_spinbox.setAlignment(Qt.AlignCenter)
+        self.fade_spinbox.setButtonSymbols(
+            QDoubleSpinBox.NoButtons
+        )
+
+        fade_row = QWidget()
+        fade_row_layout = QHBoxLayout(fade_row)
+        fade_row_layout.setContentsMargins(0, 0, 0, 0)
+        fade_row_layout.setSpacing(6)
+
+        fade_buttons = QWidget()
+        fade_buttons.setFixedWidth(30)
+        fade_buttons_layout = QVBoxLayout(fade_buttons)
+        fade_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        fade_buttons_layout.setSpacing(2)
+
+        self.fade_up_button = QPushButton("▲")
+        self.fade_up_button.setObjectName("spinArrowButton")
+        self.fade_up_button.setFixedSize(30, 20)
+        self.fade_up_button.setCursor(Qt.PointingHandCursor)
+        self.fade_up_button.clicked.connect(
+            self.fade_spinbox.stepUp
+        )
+
+        self.fade_down_button = QPushButton("▼")
+        self.fade_down_button.setObjectName("spinArrowButton")
+        self.fade_down_button.setFixedSize(30, 20)
+        self.fade_down_button.setCursor(Qt.PointingHandCursor)
+        self.fade_down_button.clicked.connect(
+            self.fade_spinbox.stepDown
+        )
+
+        fade_buttons_layout.addWidget(self.fade_up_button)
+        fade_buttons_layout.addWidget(self.fade_down_button)
+
+        fade_row_layout.addWidget(self.fade_spinbox, 1)
+        fade_row_layout.addWidget(fade_buttons)
 
         self.auto_render_checkbox = ToggleSwitch(
             "Render automatically after drop"
@@ -1269,7 +1737,7 @@ class SettingsDialog(QDialog):
         )
         form.addRow(
             "Visual fade",
-            self.fade_spinbox,
+            fade_row,
         )
         form.addRow(
             "Workflow",
@@ -1544,19 +2012,35 @@ class SettingsDialog(QDialog):
                 border-color: rgba(255, 255, 255, 14);
             }
 
-            QDoubleSpinBox::up-button,
-            QDoubleSpinBox::down-button {
-                width: 22px;
+            QPushButton#spinArrowButton {
+                background: transparent;
                 border: none;
-                background-color: rgba(255, 255, 255, 7);
+                color: #BFA8FF;
+                font-size: 9px;
+                padding: 0px;
             }
 
-            QDoubleSpinBox::up-button:hover,
-            QDoubleSpinBox::down-button:hover {
-                background-color: rgba(255, 255, 255, 14);
+            QPushButton#spinArrowButton:hover {
+                background-color: rgba(255, 255, 255, 8);
+                border: none;
+                color: #FFFFFF;
+            }
+
+            QPushButton#spinArrowButton:pressed {
+                background-color: rgba(191, 168, 255, 22);
             }
             """
         )
+
+
+@dataclass
+class RenderJob:
+    audio_path: Path
+    artwork_path: Path
+    output_dir: str
+    fade_duration: float
+    intro_path: Optional[str]
+    job_id: int = 0
 
 
 class BeatFrame(QMainWindow):
@@ -1582,11 +2066,25 @@ class BeatFrame(QMainWindow):
         self.worker = None
         self.is_rendering = False
 
+        self.active_job = None
+        self.render_queue = []
+        self.queue_paused = False
+        self._next_job_id = 1
+        self.queue_cards = {}
+        self._close_requested = False
+
         self.pending_audio = None
         self.pending_artwork = None
 
         self.build_ui()
         self.apply_styles()
+
+        self.success_toast = SuccessToast(
+            self.centralWidget()
+        )
+        self._position_success_toast()
+
+        self.taskbar_progress = WindowsTaskbarProgress(self)
 
     def build_ui(self):
         root = GradientBackground()
@@ -1720,6 +2218,24 @@ class BeatFrame(QMainWindow):
             (112 - self.status_icon.height()) // 2,
         )
 
+        self.main_browse_plus = ClickableLabel(
+            "",
+            self.status_container,
+        )
+        self.main_browse_plus.setObjectName("mainBrowsePlus")
+        self.main_browse_plus.setFixedSize(84, 84)
+        self.main_browse_plus.move(
+            (112 - self.main_browse_plus.width()) // 2,
+            (112 - self.main_browse_plus.height()) // 2,
+        )
+        self.main_browse_plus.setToolTip(
+            "Browse for audio + artwork"
+        )
+        self.main_browse_plus.clicked.connect(
+            self.browse_for_pair
+        )
+        self.main_browse_plus.raise_()
+
         self.main_label = ElidedLabel(
             "Drop your artwork + beat here"
         )
@@ -1811,10 +2327,93 @@ class BeatFrame(QMainWindow):
         )
         drop_layout.addStretch()
 
-        main_layout.addWidget(
-            self.drop_frame,
-            1,
+        self.content_row = QHBoxLayout()
+        self.content_row.setContentsMargins(0, 0, 0, 0)
+        self.content_row.setSpacing(16)
+        self.content_row.addWidget(self.drop_frame, 1)
+
+        self.queue_panel = GlassFrame()
+        self.queue_panel.setObjectName("queuePanel")
+        self.queue_panel.setFixedWidth(238)
+        self.queue_panel.hide()
+
+        queue_shadow = QGraphicsDropShadowEffect(self.queue_panel)
+        queue_shadow.setBlurRadius(42)
+        queue_shadow.setOffset(0, 10)
+        queue_shadow.setColor(QColor(64, 48, 155, 78))
+        self.queue_panel.setGraphicsEffect(queue_shadow)
+
+        queue_layout = QVBoxLayout(self.queue_panel)
+        queue_layout.setContentsMargins(14, 14, 14, 14)
+        queue_layout.setSpacing(10)
+
+        queue_header = QHBoxLayout()
+        queue_title = QLabel("Queue")
+        queue_title.setObjectName("queueTitle")
+        self.queue_count_label = QLabel("")
+        self.queue_count_label.setObjectName("queueCount")
+        self.queue_count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        queue_header.addWidget(queue_title)
+        queue_header.addStretch()
+        queue_header.addWidget(self.queue_count_label)
+        queue_layout.addLayout(queue_header)
+
+        queue_divider = QFrame()
+        queue_divider.setObjectName("queueDivider")
+        queue_divider.setFixedHeight(1)
+        queue_layout.addWidget(queue_divider)
+
+        self.queue_empty_state = QWidget()
+        empty_layout = QVBoxLayout(self.queue_empty_state)
+        empty_layout.setContentsMargins(8, 22, 8, 22)
+        empty_layout.setSpacing(7)
+        empty_layout.setAlignment(Qt.AlignCenter)
+
+        self.queue_empty_plus = ClickableLabel("＋")
+        self.queue_empty_plus.setObjectName("queueEmptyPlus")
+        self.queue_empty_plus.setAlignment(Qt.AlignCenter)
+        self.queue_empty_plus.setToolTip(
+            "Browse for audio + artwork"
         )
+        self.queue_empty_plus.clicked.connect(
+            self.browse_for_pair
+        )
+
+        self.queue_empty_title = QLabel("Add to queue")
+        self.queue_empty_title.setObjectName("queueEmptyTitle")
+        self.queue_empty_title.setAlignment(Qt.AlignCenter)
+        self.queue_empty_title.setWordWrap(True)
+
+        self.queue_empty_detail = QLabel("1 audio + 1 artwork")
+        self.queue_empty_detail.setObjectName("queueEmptyDetail")
+        self.queue_empty_detail.setAlignment(Qt.AlignCenter)
+
+        empty_layout.addStretch()
+        empty_layout.addWidget(self.queue_empty_plus)
+        empty_layout.addWidget(self.queue_empty_title)
+        empty_layout.addWidget(self.queue_empty_detail)
+        empty_layout.addStretch()
+
+        queue_layout.addWidget(self.queue_empty_state, 1)
+
+        self.queue_scroll = QScrollArea()
+        self.queue_scroll.setObjectName("queueScroll")
+        self.queue_scroll.setWidgetResizable(True)
+        self.queue_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.queue_scroll.setFrameShape(QFrame.NoFrame)
+
+        self.queue_list_widget = QWidget()
+        self.queue_list_widget.setObjectName("queueListWidget")
+        self.queue_list_layout = QVBoxLayout(self.queue_list_widget)
+        self.queue_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.queue_list_layout.setSpacing(8)
+        self.queue_list_layout.addStretch()
+
+        self.queue_scroll.setWidget(self.queue_list_widget)
+        queue_layout.addWidget(self.queue_scroll, 1)
+        self.content_row.addWidget(self.queue_panel)
+
+        main_layout.addLayout(self.content_row, 1)
 
         footer_row = QHBoxLayout()
 
@@ -1843,6 +2442,61 @@ class BeatFrame(QMainWindow):
         footer_row.addWidget(version)
 
         main_layout.addLayout(footer_row)
+
+    def closeEvent(self, event):
+        if self.is_rendering or self.thread is not None:
+            self._close_requested = True
+            self.queue_paused = True
+            self.render_queue.clear()
+
+            for job_id in list(self.queue_cards.keys()):
+                if self.active_job is None or job_id != self.active_job.job_id:
+                    self._remove_queue_card(job_id)
+
+            self.settings_button.setEnabled(False)
+            self.cancel_button.setText("Closing...")
+            self.cancel_button.setEnabled(False)
+
+            if self.worker is not None:
+                self.worker.cancel()
+
+            print(
+                "[BeatFrame] Closing: cancelling active render "
+                "and clearing queue..."
+            )
+            event.ignore()
+            return
+
+        event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+        if hasattr(self, "success_toast"):
+            self._position_success_toast()
+
+    def _position_success_toast(self):
+        if not hasattr(self, "success_toast"):
+            return
+
+        root = self.centralWidget()
+        if root is None:
+            return
+
+        margin = 28
+        x = max(
+            margin,
+            root.width()
+            - self.success_toast.width()
+            - margin,
+        )
+        y = max(
+            margin,
+            root.height()
+            - self.success_toast.height()
+            - 48,
+        )
+        self.success_toast.move(x, y)
 
     def apply_styles(self):
         self.setStyleSheet(
@@ -1966,6 +2620,66 @@ class BeatFrame(QMainWindow):
                 background-color: rgba(255, 255, 255, 7);
                 border-color: rgba(255, 255, 255, 15);
             }
+
+            QFrame#queuePanel {
+                background: transparent;
+                border: none;
+            }
+            QLabel#queueTitle {
+                color: #FFFFFF;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QLabel#queueCount {
+                color: #8E9ABD;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QLabel#queueEmptyPlus {
+                color: #BFA8FF;
+                font-size: 28px;
+            }
+            QLabel#queueEmptyPlus:hover {
+                color: #FFFFFF;
+            }
+            QLabel#queueEmptyTitle {
+                color: #E7E9F7;
+                font-size: 12px;
+                font-weight: 650;
+            }
+            QLabel#queueEmptyDetail {
+                color: #74809F;
+                font-size: 10px;
+            }
+            QFrame#queueDivider {
+                background-color: rgba(255, 255, 255, 16);
+                border: none;
+            }
+            QScrollArea#queueScroll,
+            QWidget#queueListWidget {
+                background: transparent;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 7px;
+                margin: 2px 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(151, 157, 205, 58);
+                border-radius: 3px;
+                min-height: 24px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(170, 176, 225, 90);
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: transparent;
+                height: 0px;
+            }
             """
         )
 
@@ -1977,25 +2691,45 @@ class BeatFrame(QMainWindow):
             self,
             self.settings,
         )
-        dialog.exec()
+        result = dialog.exec()
+
+        if (
+            result == QDialog.Accepted
+            and self.queue_paused
+            and self.render_queue
+            and self.thread is None
+        ):
+            self.queue_paused = False
+            self._start_next_queued_job()
 
     def dragEnterEvent(self, event):
-        if self.is_rendering:
+        auto_render = self.settings.value(
+            "auto_render",
+            True,
+            type=bool,
+        )
+
+        # Queueing is automatic in the normal auto-render workflow.
+        # Manual mode keeps the old one-pair-at-a-time behavior until
+        # we design its queue UX explicitly.
+        if self.is_rendering and not auto_render:
             return
 
         if event.mimeData().hasUrls():
-            self.drop_frame.set_drag_active(True)
+            if self.is_rendering:
+                self.queue_panel.set_drag_active(True)
+            else:
+                self.drop_frame.set_drag_active(True)
             event.acceptProposedAction()
 
     def dragLeaveEvent(self, event):
         self.drop_frame.set_drag_active(False)
+        self.queue_panel.set_drag_active(False)
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
         self.drop_frame.set_drag_active(False)
-
-        if self.is_rendering:
-            return
+        self.queue_panel.set_drag_active(False)
 
         files = [
             Path(url.toLocalFile())
@@ -2003,7 +2737,45 @@ class BeatFrame(QMainWindow):
             if url.isLocalFile()
         ]
 
-        self.clear_error_action()
+        self._handle_input_files(files)
+        event.acceptProposedAction()
+
+    def browse_for_pair(self):
+        auto_render = self.settings.value(
+            "auto_render",
+            True,
+            type=bool,
+        )
+
+        if self.is_rendering and not auto_render:
+            return
+
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Choose audio + artwork",
+            str(Path.home()),
+            (
+                "BeatFrame media "
+                "(*.wav *.mp3 *.jpg *.jpeg *.png)"
+            ),
+        )
+
+        if not file_paths:
+            return
+
+        self._handle_input_files(
+            [Path(path) for path in file_paths]
+        )
+
+    def _handle_input_files(self, files):
+        auto_render = self.settings.value(
+            "auto_render",
+            True,
+            type=bool,
+        )
+
+        if self.is_rendering and not auto_render:
+            return
 
         unsupported_audio = [
             file
@@ -2034,7 +2806,7 @@ class BeatFrame(QMainWindow):
                 .upper()
                 .lstrip(".")
             )
-            self.show_input_error(
+            self._show_drop_error(
                 f"{extension} audio isn't supported",
                 "Use WAV or MP3.",
             )
@@ -2047,7 +2819,7 @@ class BeatFrame(QMainWindow):
                 .upper()
                 .lstrip(".")
             )
-            self.show_input_error(
+            self._show_drop_error(
                 f"{extension} images aren't supported",
                 "Use JPG, JPEG or PNG.",
             )
@@ -2068,28 +2840,49 @@ class BeatFrame(QMainWindow):
         ]
 
         if (
-            len(audio_files) != 1
+            len(files) != 2
+            or len(audio_files) != 1
             or len(image_files) != 1
         ):
-            self.show_input_error(
-                "Drop exactly one audio file + one image",
+            self._show_drop_error(
+                "Choose exactly one audio file + one image",
                 "Audio: WAV or MP3  •  Image: JPG, JPEG or PNG",
             )
             return
 
-        self.pending_audio = audio_files[0]
-        self.pending_artwork = image_files[0]
-
-        auto_render = self.settings.value(
-            "auto_render",
-            True,
-            type=bool,
-        )
+        audio = audio_files[0]
+        artwork = image_files[0]
 
         if auto_render:
-            self.render_pending_files()
+            job = self._create_render_job(
+                audio,
+                artwork,
+            )
+            self._submit_job(job)
         else:
+            self.clear_error_action()
+            self.pending_audio = audio
+            self.pending_artwork = artwork
             self.show_files_ready()
+
+    def _show_drop_error(
+        self,
+        title: str,
+        detail: str,
+    ):
+        # A bad second drop must not replace the progress UI of the
+        # render that is already running. Queue cards will give this
+        # its own visual feedback in the next UX pass.
+        if self.is_rendering:
+            print(
+                f"[BeatFrame] Drop rejected: {title} — {detail}"
+            )
+            return
+
+        self.show_input_error(
+            title,
+            detail,
+        )
 
     def show_input_error(
         self,
@@ -2129,17 +2922,11 @@ class BeatFrame(QMainWindow):
 
         self.render_button.show()
 
-    def render_pending_files(self):
-        if (
-            self.pending_audio is None
-            or self.pending_artwork is None
-            or self.is_rendering
-        ):
-            return
-
-        audio = self.pending_audio
-        artwork = self.pending_artwork
-
+    def _create_render_job(
+        self,
+        audio: Path,
+        artwork: Path,
+    ):
         default_output = str(
             Path.home() / "Desktop"
         )
@@ -2171,37 +2958,194 @@ class BeatFrame(QMainWindow):
         else:
             active_intro = None
 
+        job = RenderJob(
+            audio_path=audio,
+            artwork_path=artwork,
+            output_dir=output_dir,
+            fade_duration=fade_duration,
+            intro_path=active_intro,
+            job_id=self._next_job_id,
+        )
+        self._next_job_id += 1
+        return job
+
+    def _add_queue_card(self, job: RenderJob):
+        if job.job_id in self.queue_cards:
+            return
+
+        card = QueueCard(
+            job.job_id,
+            job.audio_path.stem,
+            job.artwork_path.name,
+        )
+        card.remove_requested.connect(
+            self.remove_queued_job
+        )
+
+        index = max(0, self.queue_list_layout.count() - 1)
+        self.queue_list_layout.insertWidget(index, card)
+        self.queue_cards[job.job_id] = card
+        self._refresh_queue_panel()
+
+    def _remove_queue_card(self, job_id: int):
+        card = self.queue_cards.pop(job_id, None)
+        if card is not None:
+            self.queue_list_layout.removeWidget(card)
+            card.deleteLater()
+        self._refresh_queue_panel()
+
+    def remove_queued_job(self, job_id: int):
+        job_to_remove = next(
+            (
+                job
+                for job in self.render_queue
+                if job.job_id == job_id
+            ),
+            None,
+        )
+
+        if job_to_remove is None:
+            return
+
+        self.render_queue = [
+            job
+            for job in self.render_queue
+            if job.job_id != job_id
+        ]
+
+        self._remove_queue_card(job_id)
+
+        print(
+            f"[BeatFrame] Removed from queue: "
+            f"{job_to_remove.audio_path.name} "
+            f"({len(self.render_queue)} queued)"
+        )
+
+        self._refresh_queue_panel()
+
+    def _refresh_queue_panel(self):
+        waiting = len(self.render_queue)
+        has_active = (
+            self.active_job is not None
+            and self.is_rendering
+        )
+
+        should_show = has_active or waiting > 0
+        self.queue_panel.setVisible(should_show)
+
+        if not should_show:
+            return
+
+        self.queue_count_label.setText(
+            f"{waiting} waiting" if waiting else ""
+        )
+        self.queue_empty_state.setVisible(waiting == 0)
+        self.queue_scroll.setVisible(waiting > 0)
+
+    def _mark_active_progress(self, percent: int):
+        if self.active_job is None:
+            return
+        card = self.queue_cards.get(self.active_job.job_id)
+        if card is not None:
+            card.set_rendering(percent)
+
+    def _submit_job(
+        self,
+        job: RenderJob,
+    ):
+        self.render_queue.append(job)
+        self._add_queue_card(job)
+
+        print(
+            f"[BeatFrame] Added: {job.audio_path.name} "
+            f"(queue: {len(self.render_queue)})"
+        )
+
+        if (
+            not self.is_rendering
+            and self.thread is None
+            and not self.queue_paused
+        ):
+            self._start_next_queued_job()
+
+    def _start_next_queued_job(self):
+        if (
+            self._close_requested
+            or self.is_rendering
+            or self.thread is not None
+            or self.queue_paused
+            or not self.render_queue
+        ):
+            return
+
+        job = self.render_queue.pop(0)
+        self._refresh_queue_panel()
+        self._start_job(job)
+
+    def render_pending_files(self):
+        if (
+            self.pending_audio is None
+            or self.pending_artwork is None
+        ):
+            return
+
+        job = self._create_render_job(
+            self.pending_audio,
+            self.pending_artwork,
+        )
+
+        self.pending_audio = None
+        self.pending_artwork = None
+        self.render_button.hide()
+
+        self._submit_job(job)
+
+    def _start_job(
+        self,
+        job: RenderJob,
+    ):
+        self.active_job = job
         self.is_rendering = True
+        self.main_browse_plus.setEnabled(False)
+        self.main_browse_plus.setCursor(Qt.ArrowCursor)
 
         self.settings_button.setEnabled(False)
         self.render_button.hide()
         self.clear_error_action()
 
+        self.status_icon.setLoading(False)
+        self.status_icon.setText("")
         self.status_icon.setLoading(True)
-        self.main_label.setText(audio.stem)
-        self.detail_label.setText(
-            f"{audio.name}"
-            f"  +  "
-            f"{artwork.name}"
-        )
 
+        self.main_label.setText(job.audio_path.stem)
+        self.detail_label.setText("Rendering... 0%")
+
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.reset()
         self.progress_bar.setValue(0)
         self.progress_bar.show()
+        self.taskbar_progress.set_progress(0)
 
-        self.cancel_button.setText(
-            "Cancel"
-        )
-        self.cancel_button.setEnabled(
-            True
-        )
+        self.cancel_button.setText("Cancel")
+        self.cancel_button.setEnabled(True)
         self.cancel_button.show()
 
+        card = self.queue_cards.get(job.job_id)
+        if card is not None:
+            card.set_rendering(0)
+        self._refresh_queue_panel()
+
+        print(
+            f"[BeatFrame] Rendering: {job.audio_path.name} "
+            f"({len(self.render_queue)} queued)"
+        )
+
         self.start_render(
-            image_path=str(artwork),
-            audio_path=str(audio),
-            output_dir=output_dir,
-            fade_duration=fade_duration,
-            intro_path=active_intro,
+            image_path=str(job.artwork_path),
+            audio_path=str(job.audio_path),
+            output_dir=job.output_dir,
+            fade_duration=job.fade_duration,
+            intro_path=job.intro_path,
         )
 
     def start_render(
@@ -2254,6 +3198,9 @@ class BeatFrame(QMainWindow):
             self.worker.deleteLater
         )
         self.thread.finished.connect(
+            self._render_thread_finished
+        )
+        self.thread.finished.connect(
             self.thread.deleteLater
         )
 
@@ -2263,39 +3210,90 @@ class BeatFrame(QMainWindow):
         self,
         percent: int,
     ):
+        percent = max(0, min(100, int(percent)))
         self.progress_bar.setValue(percent)
         self.detail_label.setText(
             f"Rendering... {percent}%"
         )
+        self._mark_active_progress(percent)
+        self.taskbar_progress.set_progress(percent)
 
     def render_finished(
-
         self,
         output_path: str,
     ):
+        finished_job = self.active_job
+        finished_name = (
+            finished_job.audio_path.name
+            if finished_job is not None
+            else Path(output_path).name
+        )
+
         self.progress_bar.setValue(100)
+        self.taskbar_progress.set_progress(100)
         self.cancel_button.hide()
+        has_queued_jobs = bool(self.render_queue)
 
-        self.status_icon.playSuccess()
-        self.main_label.setText("Ready")
-        self.detail_label.setText(
-            Path(output_path).name
-        )
+        if has_queued_jobs:
+            self.success_toast.show_message(
+                Path(output_path).stem
+            )
+        else:
+            self.status_icon.playSuccess()
+            self.main_label.setText("Ready")
+            self.detail_label.setText(
+                Path(output_path).name
+            )
 
-        self.pending_audio = None
-        self.pending_artwork = None
         self.is_rendering = False
+        self.active_job = None
 
-        self.settings_button.setEnabled(True)
+        if finished_job is not None:
+            self._remove_queue_card(finished_job.job_id)
 
-        QTimer.singleShot(
-            3200,
-            self.reset_idle_state,
+        print(
+            f"[BeatFrame] Finished: {finished_name} "
+            f"({len(self.render_queue)} queued)"
         )
+
+        self._refresh_queue_panel()
+
+        if not has_queued_jobs:
+            self.settings_button.setEnabled(True)
+            QTimer.singleShot(
+                3200,
+                self.reset_idle_state,
+            )
+
+    def _render_thread_finished(self):
+        self.worker = None
+        self.thread = None
+
+        if self._close_requested:
+            self.is_rendering = False
+            self.active_job = None
+            QTimer.singleShot(
+                0,
+                self.close,
+            )
+            return
+
+        if (
+            self.render_queue
+            and not self.queue_paused
+        ):
+            self._start_next_queued_job()
+        elif not self.is_rendering:
+            self.settings_button.setEnabled(True)
+            self._refresh_queue_panel()
 
     def reset_idle_state(self):
+        self.main_browse_plus.setEnabled(True)
+        self.main_browse_plus.setCursor(Qt.PointingHandCursor)
         if (
             self.is_rendering
+            or self.thread is not None
+            or self.render_queue
             or self.pending_audio is not None
             or self.pending_artwork is not None
         ):
@@ -2303,6 +3301,7 @@ class BeatFrame(QMainWindow):
 
         self.progress_bar.hide()
         self.progress_bar.setValue(0)
+        self.taskbar_progress.clear()
         self.cancel_button.hide()
         self.cancel_button.setText(
             "Cancel"
@@ -2320,6 +3319,7 @@ class BeatFrame(QMainWindow):
         self.detail_label.setText(
             "WAV / MP3 + JPG / PNG"
         )
+        self._refresh_queue_panel()
 
     def cancel_render(self):
         if (
@@ -2337,51 +3337,83 @@ class BeatFrame(QMainWindow):
         self.worker.cancel()
 
     def render_cancelled(self):
+        cancelled_job = self.active_job
+        cancelled_name = (
+            cancelled_job.audio_path.name
+            if cancelled_job is not None
+            else "current render"
+        )
+
         self.status_icon.setLoading(False)
         self.status_icon.setText("×")
-
         self.progress_bar.hide()
         self.progress_bar.setValue(0)
-
+        self.taskbar_progress.clear()
         self.cancel_button.hide()
-        self.cancel_button.setText(
-            "Cancel"
-        )
-        self.cancel_button.setEnabled(
-            True
-        )
+        self.cancel_button.setText("Cancel")
+        self.cancel_button.setEnabled(True)
 
-        self.pending_audio = None
-        self.pending_artwork = None
+        self.active_job = None
         self.is_rendering = False
 
-        self.settings_button.setEnabled(
-            True
-        )
+        if cancelled_job is not None:
+            self._remove_queue_card(cancelled_job.job_id)
 
-        self.main_label.setText(
-            "Cancelled"
-        )
+        self.main_label.setText("Cancelled")
         self.detail_label.setText(
-            "Drop another artwork + beat when you're ready."
+            "Current render cancelled."
         )
 
-        QTimer.singleShot(
-            1400,
-            self.reset_idle_state,
+        print(
+            f"[BeatFrame] Cancelled: {cancelled_name} "
+            f"({len(self.render_queue)} queued)"
         )
+
+        self._refresh_queue_panel()
+
+        if self._close_requested:
+            return
+
+        if not self.render_queue:
+            self.settings_button.setEnabled(True)
+            QTimer.singleShot(
+                1400,
+                self.reset_idle_state,
+            )
 
     def render_failed(
         self,
         error_type: str,
         message: str,
     ):
+        failed_job = self.active_job
+        failed_name = (
+            failed_job.audio_path.name
+            if failed_job is not None
+            else "current render"
+        )
+
         self.status_icon.setLoading(False)
         self.progress_bar.setVisible(False)
-
+        self.taskbar_progress.set_error()
+        self.cancel_button.hide()
         self.clear_error_action()
 
+        self.active_job = None
+        self.is_rendering = False
+
+        if failed_job is not None:
+            card = self.queue_cards.get(failed_job.job_id)
+            if card is not None:
+                card.set_failed()
+            QTimer.singleShot(
+                1800,
+                lambda job_id=failed_job.job_id:
+                    self._remove_queue_card(job_id),
+            )
+
         if error_type == "missing_intro":
+            self.queue_paused = True
             self.status_icon.setText("!")
             self.main_label.setText(
                 "Intro file not found"
@@ -2396,6 +3428,7 @@ class BeatFrame(QMainWindow):
             )
 
         elif error_type == "invalid_intro":
+            self.queue_paused = True
             self.status_icon.setText("!")
             self.main_label.setText(
                 "Intro file couldn't be read"
@@ -2419,10 +3452,8 @@ class BeatFrame(QMainWindow):
             self.detail_label.setText(
                 "The audio file may be damaged, "
                 "invalid, or unavailable. "
-                "Drop another file."
+                "Skipping this job."
             )
-            self.pending_audio = None
-            self.pending_artwork = None
 
         elif error_type in (
             "missing_image",
@@ -2435,10 +3466,8 @@ class BeatFrame(QMainWindow):
             self.detail_label.setText(
                 "The image may be damaged, "
                 "invalid, or unavailable. "
-                "Drop another file."
+                "Skipping this job."
             )
-            self.pending_audio = None
-            self.pending_artwork = None
 
         elif error_type == "render_error":
             self.status_icon.setText("!")
@@ -2446,14 +3475,9 @@ class BeatFrame(QMainWindow):
                 "Render failed"
             )
             self.detail_label.setText(
-                "BeatFrame couldn't complete the render."
+                "BeatFrame couldn't complete the render. "
+                "Skipping this job."
             )
-
-            if (
-                self.pending_audio
-                and self.pending_artwork
-            ):
-                self.render_button.setVisible(True)
 
         else:
             self.status_icon.setText("!")
@@ -2463,6 +3487,19 @@ class BeatFrame(QMainWindow):
             self.detail_label.setText(
                 message
             )
+
+        print(
+            f"[BeatFrame] Failed: {failed_name} "
+            f"[{error_type}] ({len(self.render_queue)} queued)"
+        )
+
+        self._refresh_queue_panel()
+
+        if self._close_requested:
+            return
+
+        if not self.render_queue:
+            self.settings_button.setEnabled(True)
 
     def set_error_action(
         self,
