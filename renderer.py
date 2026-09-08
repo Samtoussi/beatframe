@@ -13,7 +13,6 @@ class MediaReadError(Exception):
     ):
         self.media_type = media_type
         self.media_path = media_path
-
         super().__init__(
             f"Could not read {media_type}: {media_path}"
         )
@@ -196,6 +195,26 @@ def run_ffmpeg_with_progress(
         )
 
 
+def build_video_filter(
+    fade_duration: float,
+    audio_duration: float,
+) -> str:
+    fade_out_start = max(
+        0,
+        audio_duration - fade_duration,
+    )
+
+    return (
+        "scale=1920:1080:"
+        "force_original_aspect_ratio=decrease,"
+        "pad=1920:1080:"
+        "(ow-iw)/2:(oh-ih)/2:black,"
+        f"fade=t=in:st=0:d={fade_duration},"
+        f"fade=t=out:"
+        f"st={fade_out_start}:d={fade_duration}"
+    )
+
+
 def render_main_video(
     image_path: str,
     audio_path: str,
@@ -206,19 +225,13 @@ def render_main_video(
         Callable[[float], None]
     ] = None,
 ):
-    fade_out_start = max(
-        0,
-        audio_duration - fade_duration,
-    )
-
-    video_filter = (
-        "scale=1920:1080:"
-        "force_original_aspect_ratio=decrease,"
-        "pad=1920:1080:"
-        "(ow-iw)/2:(oh-ih)/2:black,"
-        f"fade=t=in:st=0:d={fade_duration},"
-        f"fade=t=out:"
-        f"st={fade_out_start}:d={fade_duration}"
+    """
+    Final render when no intro is used.
+    The source audio is AAC-encoded exactly once.
+    """
+    video_filter = build_video_filter(
+        fade_duration=fade_duration,
+        audio_duration=audio_duration,
     )
 
     command = [
@@ -242,6 +255,56 @@ def render_main_video(
         "-pix_fmt", "yuv420p",
         "-t", str(audio_duration),
         "-shortest",
+        "-movflags", "+faststart",
+        "-progress", "pipe:1",
+        "-nostats",
+        output_path,
+    ]
+
+    run_ffmpeg_with_progress(
+        command=command,
+        duration=audio_duration,
+        progress_callback=progress_callback,
+    )
+
+
+def render_artwork_video(
+    image_path: str,
+    output_path: str,
+    fade_duration: float,
+    audio_duration: float,
+    progress_callback: Optional[
+        Callable[[float], None]
+    ] = None,
+):
+    """
+    Temporary video-only render for the intro workflow.
+
+    This file contains no audio. The original WAV/MP3 goes directly
+    into the final concat step, avoiding a second lossy AAC encode.
+    """
+    video_filter = build_video_filter(
+        fade_duration=fade_duration,
+        audio_duration=audio_duration,
+    )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loop", "1",
+        "-framerate", "24000/1001",
+        "-i", image_path,
+        "-vf", video_filter,
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-b:v", "16M",
+        "-maxrate", "16M",
+        "-bufsize", "32M",
+        "-r", "24000/1001",
+        "-pix_fmt", "yuv420p",
+        "-an",
+        "-t", str(audio_duration),
+        "-movflags", "+faststart",
         "-progress", "pipe:1",
         "-nostats",
         output_path,
@@ -257,23 +320,30 @@ def render_main_video(
 def concatenate_intro(
     intro_path: str,
     main_video_path: str,
+    audio_path: str,
+    audio_duration: float,
     output_path: str,
     progress_callback: Optional[
         Callable[[float], None]
     ] = None,
 ):
+    """
+    Final intro render.
+
+    Inputs:
+      0 = intro video + intro audio
+      1 = temporary artwork-only video
+      2 = original beat audio
+
+    The beat audio is AAC-encoded only once, here.
+    """
     intro_duration = get_media_duration(
         intro_path,
         media_type="intro",
     )
 
-    main_duration = get_media_duration(
-        main_video_path,
-        media_type="video",
-    )
-
     total_duration = (
-        intro_duration + main_duration
+        intro_duration + audio_duration
     )
 
     filter_complex = (
@@ -300,7 +370,7 @@ def concatenate_intro(
         "setpts=PTS-STARTPTS"
         "[v1];"
 
-        "[1:a]"
+        "[2:a]"
         "aresample=48000,"
         "aformat=sample_fmts=fltp:"
         "channel_layouts=stereo,"
@@ -317,6 +387,7 @@ def concatenate_intro(
         "-y",
         "-i", intro_path,
         "-i", main_video_path,
+        "-i", audio_path,
         "-filter_complex", filter_complex,
         "-map", "[v]",
         "-map", "[a]",
@@ -330,6 +401,7 @@ def concatenate_intro(
         "-ar", "48000",
         "-ac", "2",
         "-pix_fmt", "yuv420p",
+        "-t", str(total_duration),
         "-movflags", "+faststart",
         "-progress", "pipe:1",
         "-nostats",
@@ -452,9 +524,8 @@ def render_video(
             / "main_video.mp4"
         )
 
-        render_main_video(
+        render_artwork_video(
             image_path=image_path,
-            audio_path=audio_path,
             output_path=str(temp_main),
             fade_duration=fade_duration,
             audio_duration=audio_duration,
@@ -464,6 +535,8 @@ def render_video(
         concatenate_intro(
             intro_path=str(intro),
             main_video_path=str(temp_main),
+            audio_path=audio_path,
+            audio_duration=audio_duration,
             output_path=str(output_path),
             progress_callback=report_concat_progress,
         )
