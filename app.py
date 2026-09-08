@@ -2,7 +2,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QSettings
+from PySide6.QtCore import (
+    Qt,
+    QThread,
+    Signal,
+    QObject,
+    QSettings,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,16 +27,49 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from renderer import render_video
+from renderer import (
+    MediaReadError,
+    RenderError,
+    render_video,
+)
 
 
-AUDIO_EXTENSIONS = {".wav"}
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+AUDIO_EXTENSIONS = {
+    ".wav",
+    ".mp3",
+}
+
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+}
+
+KNOWN_AUDIO_EXTENSIONS = {
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".wma",
+}
+
+KNOWN_IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp",
+    ".gif",
+    ".tiff",
+    ".tif",
+}
 
 
 class RenderWorker(QObject):
     finished = Signal(str)
-    failed = Signal(str)
+    failed = Signal(str, str)
     progress = Signal(int)
 
     def __init__(
@@ -60,13 +99,87 @@ class RenderWorker(QObject):
                 progress_callback=self.report_progress,
             )
 
-            self.finished.emit(str(output_path))
+            self.finished.emit(
+                str(output_path)
+            )
 
-        except Exception as error:
-            self.failed.emit(str(error))
+        except MediaReadError as error:
+            if error.media_type == "audio":
+                self.failed.emit(
+                    "invalid_audio",
+                    "Audio file couldn't be read",
+                )
 
-    def report_progress(self, progress: float):
-        self.progress.emit(int(progress * 100))
+            elif error.media_type == "image":
+                self.failed.emit(
+                    "invalid_image",
+                    "Image file couldn't be read",
+                )
+
+            elif error.media_type == "intro":
+                self.failed.emit(
+                    "invalid_intro",
+                    "Intro video couldn't be read",
+                )
+
+            else:
+                self.failed.emit(
+                    "invalid_media",
+                    "Media file couldn't be read",
+                )
+
+        except FileNotFoundError as error:
+            message = str(error)
+
+            if message.startswith(
+                "Intro file not found:"
+            ):
+                self.failed.emit(
+                    "missing_intro",
+                    "Intro file not found",
+                )
+
+            elif message.startswith(
+                "Audio file not found:"
+            ):
+                self.failed.emit(
+                    "missing_audio",
+                    "Audio file not found",
+                )
+
+            elif message.startswith(
+                "Image file not found:"
+            ):
+                self.failed.emit(
+                    "missing_image",
+                    "Image file not found",
+                )
+
+            else:
+                self.failed.emit(
+                    "missing_file",
+                    "A required file could not be found",
+                )
+
+        except RenderError:
+            self.failed.emit(
+                "render_error",
+                "FFmpeg couldn't complete the render",
+            )
+
+        except Exception:
+            self.failed.emit(
+                "unknown_error",
+                "Something unexpected went wrong",
+            )
+
+    def report_progress(
+        self,
+        progress: float,
+    ):
+        self.progress.emit(
+            int(progress * 100)
+        )
 
 
 class SettingsDialog(QDialog):
@@ -79,7 +192,9 @@ class SettingsDialog(QDialog):
 
         self.settings = settings
 
-        self.setWindowTitle("BeatFrame Settings")
+        self.setWindowTitle(
+            "BeatFrame Settings"
+        )
         self.setModal(True)
         self.resize(520, 370)
 
@@ -89,16 +204,25 @@ class SettingsDialog(QDialog):
 
     def build_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(28, 24, 28, 24)
+        main_layout.setContentsMargins(
+            28,
+            24,
+            28,
+            24,
+        )
         main_layout.setSpacing(18)
 
         title = QLabel("Settings")
-        title.setObjectName("settingsTitle")
+        title.setObjectName(
+            "settingsTitle"
+        )
 
         subtitle = QLabel(
             "Configure BeatFrame once, then forget about it."
         )
-        subtitle.setObjectName("settingsSubtitle")
+        subtitle.setObjectName(
+            "settingsSubtitle"
+        )
 
         main_layout.addWidget(title)
         main_layout.addWidget(subtitle)
@@ -120,8 +244,15 @@ class SettingsDialog(QDialog):
         )
 
         intro_row = QWidget()
-        intro_row_layout = QHBoxLayout(intro_row)
-        intro_row_layout.setContentsMargins(0, 0, 0, 0)
+        intro_row_layout = QHBoxLayout(
+            intro_row
+        )
+        intro_row_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
         intro_row_layout.setSpacing(8)
 
         self.intro_button = QPushButton()
@@ -145,9 +276,14 @@ class SettingsDialog(QDialog):
         )
 
         self.fade_spinbox = QDoubleSpinBox()
-        self.fade_spinbox.setRange(0.0, 30.0)
+        self.fade_spinbox.setRange(
+            0.0,
+            30.0,
+        )
         self.fade_spinbox.setDecimals(1)
-        self.fade_spinbox.setSingleStep(0.5)
+        self.fade_spinbox.setSingleStep(
+            0.5
+        )
         self.fade_spinbox.setSuffix(" s")
 
         self.auto_render_checkbox = QCheckBox(
@@ -185,7 +321,9 @@ class SettingsDialog(QDialog):
         button_row = QHBoxLayout()
         button_row.addStretch()
 
-        cancel_button = QPushButton("Cancel")
+        cancel_button = QPushButton(
+            "Cancel"
+        )
         cancel_button.setObjectName(
             "secondaryButton"
         )
@@ -193,7 +331,9 @@ class SettingsDialog(QDialog):
             self.reject
         )
 
-        save_button = QPushButton("Save")
+        save_button = QPushButton(
+            "Save"
+        )
         save_button.setObjectName(
             "primaryButton"
         )
@@ -201,42 +341,58 @@ class SettingsDialog(QDialog):
             self.save_settings
         )
 
-        button_row.addWidget(cancel_button)
-        button_row.addWidget(save_button)
+        button_row.addWidget(
+            cancel_button
+        )
+        button_row.addWidget(
+            save_button
+        )
 
-        main_layout.addLayout(button_row)
+        main_layout.addLayout(
+            button_row
+        )
 
     def load_settings(self):
         default_output = str(
             Path.home() / "Desktop"
         )
 
-        self.output_dir = self.settings.value(
-            "output_dir",
-            default_output,
+        self.output_dir = (
+            self.settings.value(
+                "output_dir",
+                default_output,
+            )
         )
 
-        self.intro_path = self.settings.value(
-            "intro_path",
-            "",
+        self.intro_path = (
+            self.settings.value(
+                "intro_path",
+                "",
+            )
         )
 
-        intro_enabled_value = self.settings.value(
-            "intro_enabled",
-            bool(self.intro_path),
-            type=bool,
+        intro_enabled_value = (
+            self.settings.value(
+                "intro_enabled",
+                bool(self.intro_path),
+                type=bool,
+            )
         )
 
-        fade_duration = self.settings.value(
-            "fade_duration",
-            6.5,
-            type=float,
+        fade_duration = (
+            self.settings.value(
+                "fade_duration",
+                6.5,
+                type=float,
+            )
         )
 
-        auto_render = self.settings.value(
-            "auto_render",
-            True,
-            type=bool,
+        auto_render = (
+            self.settings.value(
+                "auto_render",
+                True,
+                type=bool,
+            )
         )
 
         self.output_button.setText(
@@ -259,10 +415,12 @@ class SettingsDialog(QDialog):
         self.update_intro_controls()
 
     def choose_output_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Choose output folder",
-            self.output_dir,
+        folder = (
+            QFileDialog.getExistingDirectory(
+                self,
+                "Choose output folder",
+                self.output_dir,
+            )
         )
 
         if not folder:
@@ -274,29 +432,35 @@ class SettingsDialog(QDialog):
         )
 
     def choose_intro(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Choose intro video",
-            str(Path.home()),
-            "Video files (*.mp4)",
+        file_path, _ = (
+            QFileDialog.getOpenFileName(
+                self,
+                "Choose intro video",
+                str(Path.home()),
+                "Video files (*.mp4)",
+            )
         )
 
         if not file_path:
             return
 
         self.intro_path = file_path
+
         self.update_intro_button_text()
         self.update_intro_controls()
 
     def clear_intro(self):
         self.intro_path = ""
+
         self.update_intro_button_text()
         self.update_intro_controls()
 
     def update_intro_button_text(self):
         if self.intro_path:
             self.intro_button.setText(
-                Path(self.intro_path).name
+                Path(
+                    self.intro_path
+                ).name
             )
         else:
             self.intro_button.setText(
@@ -308,10 +472,13 @@ class SettingsDialog(QDialog):
             self.intro_enabled.isChecked()
         )
 
-        self.intro_button.setEnabled(enabled)
+        self.intro_button.setEnabled(
+            enabled
+        )
 
         self.clear_intro_button.setEnabled(
-            enabled and bool(self.intro_path)
+            enabled
+            and bool(self.intro_path)
         )
 
     def save_settings(self):
@@ -456,12 +623,16 @@ class BeatFrame(QMainWindow):
         subtitle = QLabel(
             "Artwork + audio → YouTube-ready video"
         )
-        subtitle.setObjectName("subtitle")
+        subtitle.setObjectName(
+            "subtitle"
+        )
 
         header_text.addWidget(title)
         header_text.addWidget(subtitle)
 
-        self.settings_button = QPushButton("⚙")
+        self.settings_button = QPushButton(
+            "⚙"
+        )
         self.settings_button.setObjectName(
             "settingsButton"
         )
@@ -473,13 +644,17 @@ class BeatFrame(QMainWindow):
             self.open_settings
         )
 
-        header_row.addLayout(header_text)
+        header_row.addLayout(
+            header_text
+        )
         header_row.addStretch()
         header_row.addWidget(
             self.settings_button
         )
 
-        main_layout.addLayout(header_row)
+        main_layout.addLayout(
+            header_row
+        )
 
         self.drop_frame = QFrame()
         self.drop_frame.setObjectName(
@@ -523,7 +698,7 @@ class BeatFrame(QMainWindow):
         )
 
         self.detail_label = QLabel(
-            "WAV + JPG / PNG"
+            "WAV / MP3 + JPG / PNG"
         )
         self.detail_label.setObjectName(
             "detailLabel"
@@ -536,9 +711,14 @@ class BeatFrame(QMainWindow):
         self.progress_bar.setObjectName(
             "progressBar"
         )
-        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setRange(
+            0,
+            100,
+        )
         self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setTextVisible(
+            True
+        )
         self.progress_bar.hide()
 
         self.render_button = QPushButton(
@@ -551,6 +731,14 @@ class BeatFrame(QMainWindow):
             self.render_pending_files
         )
         self.render_button.hide()
+
+        self.error_action_button = (
+            QPushButton()
+        )
+        self.error_action_button.setObjectName(
+            "renderButton"
+        )
+        self.error_action_button.hide()
 
         drop_layout.addStretch()
         drop_layout.addWidget(
@@ -570,6 +758,10 @@ class BeatFrame(QMainWindow):
             self.render_button,
             alignment=Qt.AlignCenter,
         )
+        drop_layout.addWidget(
+            self.error_action_button,
+            alignment=Qt.AlignCenter,
+        )
         drop_layout.addStretch()
 
         main_layout.addWidget(
@@ -580,12 +772,16 @@ class BeatFrame(QMainWindow):
         footer = QLabel(
             "BeatFrame handles the rest."
         )
-        footer.setObjectName("footer")
+        footer.setObjectName(
+            "footer"
+        )
         footer.setAlignment(
             Qt.AlignCenter
         )
 
-        main_layout.addWidget(footer)
+        main_layout.addWidget(
+            footer
+        )
 
     def apply_styles(self):
         self.setStyleSheet(
@@ -700,22 +896,81 @@ class BeatFrame(QMainWindow):
 
         dialog.exec()
 
-    def dragEnterEvent(self, event):
+    def dragEnterEvent(
+        self,
+        event,
+    ):
         if self.is_rendering:
             return
 
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
-    def dropEvent(self, event):
+    def dropEvent(
+        self,
+        event,
+    ):
         if self.is_rendering:
             return
 
         files = [
             Path(url.toLocalFile())
-            for url in event.mimeData().urls()
+            for url
+            in event.mimeData().urls()
             if url.isLocalFile()
         ]
+
+        self.clear_error_action()
+
+        unsupported_audio = [
+            file
+            for file in files
+            if (
+                file.suffix.lower()
+                in KNOWN_AUDIO_EXTENSIONS
+                and file.suffix.lower()
+                not in AUDIO_EXTENSIONS
+            )
+        ]
+
+        unsupported_images = [
+            file
+            for file in files
+            if (
+                file.suffix.lower()
+                in KNOWN_IMAGE_EXTENSIONS
+                and file.suffix.lower()
+                not in IMAGE_EXTENSIONS
+            )
+        ]
+
+        if unsupported_audio:
+            extension = (
+                unsupported_audio[0]
+                .suffix
+                .upper()
+                .lstrip(".")
+            )
+
+            self.show_input_error(
+                f"{extension} audio isn't supported",
+                "Use WAV or MP3.",
+            )
+            return
+
+        if unsupported_images:
+            extension = (
+                unsupported_images[0]
+                .suffix
+                .upper()
+                .lstrip(".")
+            )
+
+            self.show_input_error(
+                f"{extension} images aren't supported",
+                "Use JPG, JPEG or PNG.",
+            )
+            return
 
         audio_files = [
             file
@@ -735,34 +990,50 @@ class BeatFrame(QMainWindow):
             len(audio_files) != 1
             or len(image_files) != 1
         ):
-            self.pending_audio = None
-            self.pending_artwork = None
-
-            self.progress_bar.hide()
-            self.render_button.hide()
-
-            self.status_icon.setText("!")
-            self.main_label.setText(
-                "Drop exactly one WAV + one image"
-            )
-            self.detail_label.setText(
-                "Supported: WAV, JPG, JPEG, PNG"
+            self.show_input_error(
+                "Drop exactly one audio file + one image",
+                "Audio: WAV or MP3  •  Image: JPG, JPEG or PNG",
             )
             return
 
-        self.pending_audio = audio_files[0]
-        self.pending_artwork = image_files[0]
+        self.pending_audio = (
+            audio_files[0]
+        )
 
-        auto_render = self.settings.value(
-            "auto_render",
-            True,
-            type=bool,
+        self.pending_artwork = (
+            image_files[0]
+        )
+
+        auto_render = (
+            self.settings.value(
+                "auto_render",
+                True,
+                type=bool,
+            )
         )
 
         if auto_render:
             self.render_pending_files()
         else:
             self.show_files_ready()
+
+    def show_input_error(
+        self,
+        title: str,
+        detail: str,
+    ):
+        self.pending_audio = None
+        self.pending_artwork = None
+
+        self.progress_bar.hide()
+        self.render_button.hide()
+        self.clear_error_action()
+
+        self.status_icon.setText("!")
+        self.main_label.setText(title)
+        self.detail_label.setText(
+            detail
+        )
 
     def show_files_ready(self):
         if (
@@ -771,12 +1042,16 @@ class BeatFrame(QMainWindow):
         ):
             return
 
+        self.clear_error_action()
         self.progress_bar.hide()
 
         self.status_icon.setText("✓")
-        self.main_label.setText("Files ready")
+        self.main_label.setText(
+            "Files ready"
+        )
         self.detail_label.setText(
-            f"{self.pending_audio.name}  +  "
+            f"{self.pending_audio.name}"
+            f"  +  "
             f"{self.pending_artwork.name}"
         )
 
@@ -797,44 +1072,61 @@ class BeatFrame(QMainWindow):
             Path.home() / "Desktop"
         )
 
-        output_dir = self.settings.value(
-            "output_dir",
-            default_output,
+        output_dir = (
+            self.settings.value(
+                "output_dir",
+                default_output,
+            )
         )
 
-        fade_duration = self.settings.value(
-            "fade_duration",
-            6.5,
-            type=float,
+        fade_duration = (
+            self.settings.value(
+                "fade_duration",
+                6.5,
+                type=float,
+            )
         )
 
-        intro_enabled = self.settings.value(
-            "intro_enabled",
-            False,
-            type=bool,
+        intro_enabled = (
+            self.settings.value(
+                "intro_enabled",
+                False,
+                type=bool,
+            )
         )
 
-        intro_path = self.settings.value(
-            "intro_path",
-            "",
+        intro_path = (
+            self.settings.value(
+                "intro_path",
+                "",
+            )
         )
 
-        if intro_enabled and intro_path:
+        if (
+            intro_enabled
+            and intro_path
+        ):
             active_intro = intro_path
         else:
             active_intro = None
 
         self.is_rendering = True
 
-        self.settings_button.setEnabled(False)
+        self.settings_button.setEnabled(
+            False
+        )
+
         self.render_button.hide()
+        self.clear_error_action()
 
         self.status_icon.setText("●")
         self.main_label.setText(
             audio.stem
         )
         self.detail_label.setText(
-            f"{audio.name}  +  {artwork.name}"
+            f"{audio.name}"
+            f"  +  "
+            f"{artwork.name}"
         )
 
         self.progress_bar.setValue(0)
@@ -920,10 +1212,14 @@ class BeatFrame(QMainWindow):
         self,
         output_path: str,
     ):
-        self.progress_bar.setValue(100)
+        self.progress_bar.setValue(
+            100
+        )
 
         self.status_icon.setText("✓")
-        self.main_label.setText("Ready")
+        self.main_label.setText(
+            "Ready"
+        )
         self.detail_label.setText(
             Path(output_path).name
         )
@@ -932,34 +1228,121 @@ class BeatFrame(QMainWindow):
         self.pending_artwork = None
 
         self.is_rendering = False
+
         self.settings_button.setEnabled(
             True
         )
 
     def render_failed(
         self,
-        error: str,
+        error_type: str,
+        message: str,
     ):
         self.progress_bar.hide()
+        self.render_button.hide()
 
         self.status_icon.setText("!")
         self.main_label.setText(
-            "Render failed"
-        )
-        self.detail_label.setText(
-            error
+            message
         )
 
         self.is_rendering = False
+
         self.settings_button.setEnabled(
             True
         )
 
-        if (
-            self.pending_audio is not None
-            and self.pending_artwork is not None
-        ):
-            self.render_button.show()
+        if error_type == "missing_intro":
+            self.detail_label.setText(
+                "Choose a new intro in Settings or turn off Use intro video."
+            )
+
+            self.set_error_action(
+                "Open Settings",
+                self.open_settings,
+            )
+
+            return
+
+        if error_type == "invalid_intro":
+            self.detail_label.setText(
+                "The intro video may be damaged or invalid."
+            )
+
+            self.set_error_action(
+                "Open Settings",
+                self.open_settings,
+            )
+
+            return
+
+        if error_type in {
+            "invalid_audio",
+            "missing_audio",
+        }:
+            self.detail_label.setText(
+                "The audio file may be damaged, invalid, or unavailable. Drop another file."
+            )
+
+            self.pending_audio = None
+            self.pending_artwork = None
+            return
+
+        if error_type in {
+            "invalid_image",
+            "missing_image",
+        }:
+            self.detail_label.setText(
+                "The image may be damaged, invalid, or unavailable. Drop another file."
+            )
+
+            self.pending_audio = None
+            self.pending_artwork = None
+            return
+
+        if error_type == "render_error":
+            self.detail_label.setText(
+                "The render couldn't be completed. You can try again."
+            )
+
+            if (
+                self.pending_audio
+                is not None
+                and self.pending_artwork
+                is not None
+            ):
+                self.render_button.show()
+
+            return
+
+        self.detail_label.setText(
+            "Please try again or drop the files again."
+        )
+
+    def set_error_action(
+        self,
+        text: str,
+        callback,
+    ):
+        self.clear_error_action()
+
+        self.error_action_button.setText(
+            text
+        )
+
+        self.error_action_button.clicked.connect(
+            callback
+        )
+
+        self.error_action_button.show()
+
+    def clear_error_action(self):
+        try:
+            self.error_action_button.clicked.disconnect()
+        except RuntimeError:
+            pass
+
+        self.error_action_button.hide()
 
 
 app = QApplication(sys.argv)

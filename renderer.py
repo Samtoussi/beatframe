@@ -5,7 +5,28 @@ import tempfile
 from typing import Callable, Optional
 
 
-def get_media_duration(media_path: str) -> float:
+class MediaReadError(Exception):
+    def __init__(
+        self,
+        media_type: str,
+        media_path: str,
+    ):
+        self.media_type = media_type
+        self.media_path = media_path
+
+        super().__init__(
+            f"Could not read {media_type}: {media_path}"
+        )
+
+
+class RenderError(Exception):
+    pass
+
+
+def get_media_duration(
+    media_path: str,
+    media_type: str = "media",
+) -> float:
     probe_command = [
         "ffprobe",
         "-v", "quiet",
@@ -14,22 +35,99 @@ def get_media_duration(media_path: str) -> float:
         media_path,
     ]
 
-    result = subprocess.run(
-        probe_command,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        result = subprocess.run(
+            probe_command,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
 
-    data = json.loads(result.stdout)
-    return float(data["format"]["duration"])
+        data = json.loads(result.stdout)
+        duration = float(
+            data["format"]["duration"]
+        )
+
+        if duration <= 0:
+            raise ValueError(
+                "Media duration must be positive."
+            )
+
+        return duration
+
+    except (
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        raise MediaReadError(
+            media_type=media_type,
+            media_path=media_path,
+        )
+
+
+def validate_image(
+    image_path: str,
+):
+    probe_command = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries",
+        "stream=codec_type,width,height",
+        "-of", "json",
+        image_path,
+    ]
+
+    try:
+        result = subprocess.run(
+            probe_command,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+
+        if not streams:
+            raise ValueError(
+                "No image stream found."
+            )
+
+        stream = streams[0]
+
+        if (
+            stream.get("codec_type") != "video"
+            or not stream.get("width")
+            or not stream.get("height")
+        ):
+            raise ValueError(
+                "Invalid image stream."
+            )
+
+    except (
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        raise MediaReadError(
+            media_type="image",
+            media_path=image_path,
+        )
 
 
 def get_unique_output_path(
     output_folder: Path,
     stem: str,
 ) -> Path:
-    output_path = output_folder / f"{stem}.mp4"
+    output_path = (
+        output_folder / f"{stem}.mp4"
+    )
 
     if not output_path.exists():
         return output_path
@@ -51,7 +149,9 @@ def get_unique_output_path(
 def run_ffmpeg_with_progress(
     command: list,
     duration: float,
-    progress_callback: Optional[Callable[[float], None]] = None,
+    progress_callback: Optional[
+        Callable[[float], None]
+    ] = None,
 ):
     process = subprocess.Popen(
         command,
@@ -61,17 +161,20 @@ def run_ffmpeg_with_progress(
     )
 
     if process.stdout is None:
-        raise RuntimeError(
-            "Could not read FFmpeg progress output."
+        raise RenderError(
+            "Could not read FFmpeg progress."
         )
 
     for line in process.stdout:
         line = line.strip()
 
         if line.startswith("out_time_ms="):
-            out_time_us = int(
-                line.split("=", 1)[1]
-            )
+            try:
+                out_time_us = int(
+                    line.split("=", 1)[1]
+                )
+            except ValueError:
+                continue
 
             current_seconds = (
                 out_time_us / 1_000_000
@@ -88,9 +191,8 @@ def run_ffmpeg_with_progress(
     return_code = process.wait()
 
     if return_code != 0:
-        raise subprocess.CalledProcessError(
-            return_code,
-            command,
+        raise RenderError(
+            "FFmpeg could not complete the render."
         )
 
 
@@ -99,12 +201,11 @@ def render_main_video(
     audio_path: str,
     output_path: str,
     fade_duration: float,
-    progress_callback: Optional[Callable[[float], None]] = None,
+    audio_duration: float,
+    progress_callback: Optional[
+        Callable[[float], None]
+    ] = None,
 ):
-    audio_duration = get_media_duration(
-        audio_path
-    )
-
     fade_out_start = max(
         0,
         audio_duration - fade_duration,
@@ -156,14 +257,18 @@ def concatenate_intro(
     intro_path: str,
     main_video_path: str,
     output_path: str,
-    progress_callback: Optional[Callable[[float], None]] = None,
+    progress_callback: Optional[
+        Callable[[float], None]
+    ] = None,
 ):
     intro_duration = get_media_duration(
-        intro_path
+        intro_path,
+        media_type="intro",
     )
 
     main_duration = get_media_duration(
-        main_video_path
+        main_video_path,
+        media_type="video",
     )
 
     total_duration = (
@@ -243,10 +348,30 @@ def render_video(
     output_dir: str,
     fade_duration: float = 6.5,
     intro_path: Optional[str] = None,
-    progress_callback: Optional[Callable[[float], None]] = None,
+    progress_callback: Optional[
+        Callable[[float], None]
+    ] = None,
 ) -> Path:
     audio = Path(audio_path)
+    image = Path(image_path)
     output_folder = Path(output_dir)
+
+    if not audio.exists():
+        raise FileNotFoundError(
+            f"Audio file not found: {audio}"
+        )
+
+    if not image.exists():
+        raise FileNotFoundError(
+            f"Image file not found: {image}"
+        )
+
+    audio_duration = get_media_duration(
+        audio_path,
+        media_type="audio",
+    )
+
+    validate_image(image_path)
 
     output_folder.mkdir(
         parents=True,
@@ -258,16 +383,13 @@ def render_video(
         stem=audio.stem,
     )
 
-    audio_duration = get_media_duration(
-        audio_path
-    )
-
     if not intro_path:
         render_main_video(
             image_path=image_path,
             audio_path=audio_path,
             output_path=str(output_path),
             fade_duration=fade_duration,
+            audio_duration=audio_duration,
             progress_callback=progress_callback,
         )
 
@@ -284,7 +406,8 @@ def render_video(
         )
 
     intro_duration = get_media_duration(
-        str(intro)
+        str(intro),
+        media_type="intro",
     )
 
     main_work = audio_duration
@@ -333,6 +456,7 @@ def render_video(
             audio_path=audio_path,
             output_path=str(temp_main),
             fade_duration=fade_duration,
+            audio_duration=audio_duration,
             progress_callback=report_main_progress,
         )
 
