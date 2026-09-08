@@ -282,7 +282,7 @@ class SettingsDialog(QDialog):
         )
         self.fade_spinbox.setDecimals(1)
         self.fade_spinbox.setSingleStep(
-            0.5
+            0.1
         )
         self.fade_spinbox.setSuffix(" s")
 
