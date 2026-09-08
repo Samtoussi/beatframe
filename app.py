@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QObject, QSettings
 from PySide6.QtWidgets import (
@@ -28,11 +29,19 @@ class RenderWorker(QObject):
     failed = Signal(str)
     progress = Signal(int)
 
-    def __init__(self, image_path: str, audio_path: str, output_dir: str):
+    def __init__(
+        self,
+        image_path: str,
+        audio_path: str,
+        output_dir: str,
+        intro_path: Optional[str],
+    ):
         super().__init__()
+
         self.image_path = image_path
         self.audio_path = audio_path
         self.output_dir = output_dir
+        self.intro_path = intro_path
 
     def run(self):
         try:
@@ -40,6 +49,7 @@ class RenderWorker(QObject):
                 image_path=self.image_path,
                 audio_path=self.audio_path,
                 output_dir=self.output_dir,
+                intro_path=self.intro_path,
                 progress_callback=self.report_progress,
             )
 
@@ -57,16 +67,22 @@ class BeatFrame(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("BeatFrame")
-        self.resize(760, 560)
-        self.setMinimumSize(680, 500)
+        self.resize(760, 620)
+        self.setMinimumSize(680, 560)
         self.setAcceptDrops(True)
 
         self.settings = QSettings("BeatFrame", "BeatFrame")
 
         default_output = str(Path.home() / "Desktop")
+
         self.output_dir = self.settings.value(
             "output_dir",
             default_output,
+        )
+
+        self.intro_path = self.settings.value(
+            "intro_path",
+            "",
         )
 
         self.thread = None
@@ -75,6 +91,7 @@ class BeatFrame(QMainWindow):
 
         self.build_ui()
         self.apply_styles()
+        self.update_intro_label()
 
     def build_ui(self):
         root = QWidget()
@@ -82,9 +99,8 @@ class BeatFrame(QMainWindow):
 
         main_layout = QVBoxLayout(root)
         main_layout.setContentsMargins(36, 30, 36, 30)
-        main_layout.setSpacing(24)
+        main_layout.setSpacing(18)
 
-        # Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(4)
 
@@ -99,7 +115,6 @@ class BeatFrame(QMainWindow):
 
         main_layout.addLayout(header_layout)
 
-        # Drop zone
         self.drop_frame = QFrame()
         self.drop_frame.setObjectName("dropFrame")
         self.drop_frame.setSizePolicy(
@@ -141,9 +156,8 @@ class BeatFrame(QMainWindow):
 
         main_layout.addWidget(self.drop_frame, 1)
 
-        # Output section
         output_section = QFrame()
-        output_section.setObjectName("outputSection")
+        output_section.setObjectName("settingsSection")
 
         output_layout = QHBoxLayout(output_section)
         output_layout.setContentsMargins(18, 14, 18, 14)
@@ -153,19 +167,16 @@ class BeatFrame(QMainWindow):
         output_text_layout.setSpacing(2)
 
         output_title = QLabel("Output folder")
-        output_title.setObjectName("outputTitle")
+        output_title.setObjectName("sectionTitle")
 
         self.output_label = QLabel(self.output_dir)
-        self.output_label.setObjectName("outputPath")
-        self.output_label.setTextInteractionFlags(
-            Qt.TextSelectableByMouse
-        )
+        self.output_label.setObjectName("sectionValue")
 
         output_text_layout.addWidget(output_title)
         output_text_layout.addWidget(self.output_label)
 
         self.output_button = QPushButton("Change")
-        self.output_button.setObjectName("outputButton")
+        self.output_button.setObjectName("settingsButton")
         self.output_button.clicked.connect(
             self.choose_output_folder
         )
@@ -174,6 +185,43 @@ class BeatFrame(QMainWindow):
         output_layout.addWidget(self.output_button)
 
         main_layout.addWidget(output_section)
+
+        intro_section = QFrame()
+        intro_section.setObjectName("settingsSection")
+
+        intro_layout = QHBoxLayout(intro_section)
+        intro_layout.setContentsMargins(18, 14, 18, 14)
+        intro_layout.setSpacing(16)
+
+        intro_text_layout = QVBoxLayout()
+        intro_text_layout.setSpacing(2)
+
+        intro_title = QLabel("Intro")
+        intro_title.setObjectName("sectionTitle")
+
+        self.intro_label = QLabel()
+        self.intro_label.setObjectName("sectionValue")
+
+        intro_text_layout.addWidget(intro_title)
+        intro_text_layout.addWidget(self.intro_label)
+
+        self.intro_button = QPushButton("Choose")
+        self.intro_button.setObjectName("settingsButton")
+        self.intro_button.clicked.connect(
+            self.choose_intro
+        )
+
+        self.clear_intro_button = QPushButton("Remove")
+        self.clear_intro_button.setObjectName("secondaryButton")
+        self.clear_intro_button.clicked.connect(
+            self.clear_intro
+        )
+
+        intro_layout.addLayout(intro_text_layout, 1)
+        intro_layout.addWidget(self.clear_intro_button)
+        intro_layout.addWidget(self.intro_button)
+
+        main_layout.addWidget(intro_section)
 
     def apply_styles(self):
         self.setStyleSheet(
@@ -238,41 +286,52 @@ class BeatFrame(QMainWindow):
                 background-color: #ffffff;
             }
 
-            QFrame#outputSection {
+            QFrame#settingsSection {
                 background-color: #181a1e;
                 border: 1px solid #26292f;
                 border-radius: 14px;
             }
 
-            QLabel#outputTitle {
+            QLabel#sectionTitle {
                 font-size: 13px;
                 font-weight: 600;
                 color: #ffffff;
             }
 
-            QLabel#outputPath {
+            QLabel#sectionValue {
                 font-size: 12px;
                 color: #7f8490;
             }
 
-            QPushButton#outputButton {
-                background-color: #25282e;
-                border: 1px solid #343840;
+            QPushButton#settingsButton,
+            QPushButton#secondaryButton {
                 border-radius: 9px;
                 padding: 8px 16px;
-                color: #f3f3f3;
                 font-weight: 600;
             }
 
-            QPushButton#outputButton:hover {
+            QPushButton#settingsButton {
+                background-color: #25282e;
+                border: 1px solid #343840;
+                color: #f3f3f3;
+            }
+
+            QPushButton#settingsButton:hover {
                 background-color: #2e3239;
             }
 
-            QPushButton#outputButton:pressed {
-                background-color: #202329;
+            QPushButton#secondaryButton {
+                background-color: transparent;
+                border: 1px solid #2b2e34;
+                color: #8f939b;
             }
 
-            QPushButton#outputButton:disabled {
+            QPushButton#secondaryButton:hover {
+                background-color: #202329;
+                color: #f3f3f3;
+            }
+
+            QPushButton:disabled {
                 color: #5f636c;
                 background-color: #1d1f23;
                 border-color: #25282e;
@@ -291,35 +350,56 @@ class BeatFrame(QMainWindow):
             return
 
         self.output_dir = folder
-        self.settings.setValue(
-            "output_dir",
-            self.output_dir,
+        self.settings.setValue("output_dir", self.output_dir)
+        self.output_label.setText(self.output_dir)
+
+    def choose_intro(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose intro video",
+            str(Path.home()),
+            "Video files (*.mp4)",
         )
 
-        self.output_label.setText(self.output_dir)
+        if not file_path:
+            return
+
+        self.intro_path = file_path
+        self.settings.setValue("intro_path", self.intro_path)
+        self.update_intro_label()
+
+    def clear_intro(self):
+        self.intro_path = ""
+        self.settings.remove("intro_path")
+        self.update_intro_label()
+
+    def update_intro_label(self):
+        if self.intro_path:
+            self.intro_label.setText(
+                Path(self.intro_path).name
+            )
+            self.clear_intro_button.setEnabled(True)
+        else:
+            self.intro_label.setText("None")
+            self.clear_intro_button.setEnabled(False)
+
+    def set_controls_enabled(self, enabled: bool):
+        self.output_button.setEnabled(enabled)
+        self.intro_button.setEnabled(enabled)
+
+        if enabled:
+            self.update_intro_label()
+        else:
+            self.clear_intro_button.setEnabled(False)
 
     def dragEnterEvent(self, event):
         if self.is_rendering:
             return
 
         if event.mimeData().hasUrls():
-            self.drop_frame.setStyleSheet(
-                """
-                QFrame#dropFrame {
-                    background-color: #1d2025;
-                    border: 2px dashed #8a8f98;
-                    border-radius: 18px;
-                }
-                """
-            )
             event.acceptProposedAction()
 
-    def dragLeaveEvent(self, event):
-        self.drop_frame.setStyleSheet("")
-
     def dropEvent(self, event):
-        self.drop_frame.setStyleSheet("")
-
         if self.is_rendering:
             return
 
@@ -350,11 +430,13 @@ class BeatFrame(QMainWindow):
         if not audio or not artwork:
             self.status_icon.setText("!")
             self.main_label.setText("I need one WAV + one image")
-            self.detail_label.setText("Supported: WAV, JPG, JPEG, PNG")
+            self.detail_label.setText(
+                "Supported: WAV, JPG, JPEG, PNG"
+            )
             return
 
         self.is_rendering = True
-        self.output_button.setEnabled(False)
+        self.set_controls_enabled(False)
 
         self.status_icon.setText("●")
         self.main_label.setText(audio.stem)
@@ -365,10 +447,13 @@ class BeatFrame(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.show()
 
+        intro_path = self.intro_path or None
+
         self.start_render(
             image_path=str(artwork),
             audio_path=str(audio),
             output_dir=self.output_dir,
+            intro_path=intro_path,
         )
 
     def start_render(
@@ -376,6 +461,7 @@ class BeatFrame(QMainWindow):
         image_path: str,
         audio_path: str,
         output_dir: str,
+        intro_path: Optional[str],
     ):
         self.thread = QThread()
 
@@ -383,6 +469,7 @@ class BeatFrame(QMainWindow):
             image_path=image_path,
             audio_path=audio_path,
             output_dir=output_dir,
+            intro_path=intro_path,
         )
 
         self.worker.moveToThread(self.thread)
@@ -396,6 +483,7 @@ class BeatFrame(QMainWindow):
         self.worker.finished.connect(
             self.render_finished
         )
+
         self.worker.failed.connect(
             self.render_failed
         )
@@ -403,6 +491,7 @@ class BeatFrame(QMainWindow):
         self.worker.finished.connect(
             self.thread.quit
         )
+
         self.worker.failed.connect(
             self.thread.quit
         )
@@ -410,6 +499,7 @@ class BeatFrame(QMainWindow):
         self.thread.finished.connect(
             self.worker.deleteLater
         )
+
         self.thread.finished.connect(
             self.thread.deleteLater
         )
@@ -431,8 +521,8 @@ class BeatFrame(QMainWindow):
             Path(output_path).name
         )
 
-        self.output_button.setEnabled(True)
         self.is_rendering = False
+        self.set_controls_enabled(True)
 
     def render_failed(self, error: str):
         self.progress_bar.hide()
@@ -441,8 +531,8 @@ class BeatFrame(QMainWindow):
         self.main_label.setText("Render failed")
         self.detail_label.setText(error)
 
-        self.output_button.setEnabled(True)
         self.is_rendering = False
+        self.set_controls_enabled(True)
 
 
 app = QApplication(sys.argv)
