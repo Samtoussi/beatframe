@@ -25,6 +25,29 @@ def get_media_duration(media_path: str) -> float:
     return float(data["format"]["duration"])
 
 
+def get_unique_output_path(
+    output_folder: Path,
+    stem: str,
+) -> Path:
+    output_path = output_folder / f"{stem}.mp4"
+
+    if not output_path.exists():
+        return output_path
+
+    counter = 2
+
+    while True:
+        candidate = (
+            output_folder
+            / f"{stem}_{counter}.mp4"
+        )
+
+        if not candidate.exists():
+            return candidate
+
+        counter += 1
+
+
 def run_ffmpeg_with_progress(
     command: list,
     duration: float,
@@ -46,8 +69,13 @@ def run_ffmpeg_with_progress(
         line = line.strip()
 
         if line.startswith("out_time_ms="):
-            out_time_us = int(line.split("=", 1)[1])
-            current_seconds = out_time_us / 1_000_000
+            out_time_us = int(
+                line.split("=", 1)[1]
+            )
+
+            current_seconds = (
+                out_time_us / 1_000_000
+            )
 
             progress = min(
                 current_seconds / duration,
@@ -73,7 +101,10 @@ def render_main_video(
     fade_duration: float,
     progress_callback: Optional[Callable[[float], None]] = None,
 ):
-    audio_duration = get_media_duration(audio_path)
+    audio_duration = get_media_duration(
+        audio_path
+    )
+
     fade_out_start = max(
         0,
         audio_duration - fade_duration,
@@ -127,10 +158,17 @@ def concatenate_intro(
     output_path: str,
     progress_callback: Optional[Callable[[float], None]] = None,
 ):
-    intro_duration = get_media_duration(intro_path)
-    main_duration = get_media_duration(main_video_path)
+    intro_duration = get_media_duration(
+        intro_path
+    )
 
-    total_duration = intro_duration + main_duration
+    main_duration = get_media_duration(
+        main_video_path
+    )
+
+    total_duration = (
+        intro_duration + main_duration
+    )
 
     filter_complex = (
         "[0:v]"
@@ -215,8 +253,9 @@ def render_video(
         exist_ok=True,
     )
 
-    output_path = (
-        output_folder / f"{audio.stem}.mp4"
+    output_path = get_unique_output_path(
+        output_folder=output_folder,
+        stem=audio.stem,
     )
 
     audio_duration = get_media_duration(
@@ -249,22 +288,34 @@ def render_video(
     )
 
     main_work = audio_duration
+
     concat_work = (
         audio_duration + intro_duration
     )
 
-    total_work = main_work + concat_work
+    total_work = (
+        main_work + concat_work
+    )
 
-    main_weight = main_work / total_work
-    concat_weight = concat_work / total_work
+    main_weight = (
+        main_work / total_work
+    )
 
-    def report_main_progress(progress: float):
+    concat_weight = (
+        concat_work / total_work
+    )
+
+    def report_main_progress(
+        progress: float,
+    ):
         if progress_callback:
             progress_callback(
                 progress * main_weight
             )
 
-    def report_concat_progress(progress: float):
+    def report_concat_progress(
+        progress: float,
+    ):
         if progress_callback:
             progress_callback(
                 main_weight
@@ -273,7 +324,8 @@ def render_video(
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_main = (
-            Path(temp_dir) / "main_video.mp4"
+            Path(temp_dir)
+            / "main_video.mp4"
         )
 
         render_main_video(
