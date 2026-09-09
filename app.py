@@ -59,8 +59,45 @@ from renderer import (
 
 
 BASE_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = BASE_DIR / "assets"
+
+# PyInstaller extracts bundled resources to sys._MEIPASS.
+# In normal development mode, resources live beside app.py.
+RESOURCE_DIR = Path(
+    getattr(sys, "_MEIPASS", BASE_DIR)
+)
+
+ASSETS_DIR = RESOURCE_DIR / "assets"
 LOGO_PATH = ASSETS_DIR / "logo.png"
+APP_ICON_PATH = (
+    ASSETS_DIR / "beatframe.ico"
+    if sys.platform == "win32"
+    else LOGO_PATH
+)
+
+
+# Keep bundled FFmpeg/ffprobe processes invisible in the packaged
+# Windows GUI. Other platforms keep their normal subprocess behavior.
+WINDOWS_SUBPROCESS_FLAGS = (
+    subprocess.CREATE_NO_WINDOW
+    if sys.platform == "win32"
+    else 0
+)
+
+
+def set_windows_app_user_model_id():
+    """Give the packaged Windows app a stable taskbar identity."""
+    if sys.platform != "win32":
+        return
+
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "BeatFrame.BeatFrame"
+        )
+    except Exception:
+        # Cosmetic Windows integration only.
+        pass
 
 
 AUDIO_EXTENSIONS = {
@@ -108,12 +145,34 @@ class WindowsTaskbarProgress:
     def __init__(self, window):
         self._window = window
         self._taskbar = None
+        self._pointer = None
+        self._base_pointer = None
+        self._initialized = False
+        self._last_error = None
 
+    @staticmethod
+    def _failed_hresult(value):
+        return int(value) < 0
+
+    def initialize(self):
+        """
+        Initialize the Windows taskbar COM object after the Qt window exists.
+
+        Important:
+        We first create the legacy ITaskbarList interface, then explicitly
+        QueryInterface for ITaskbarList3. Some Windows environments reject
+        requesting ITaskbarList3 directly from CoCreateInstance with
+        E_NOINTERFACE ("Interface not supported").
+        """
         if sys.platform != "win32":
-            return
+            return False
+
+        if self._initialized and self._taskbar is not None:
+            return True
 
         try:
             import ctypes
+            import uuid
             from ctypes import wintypes
 
             HRESULT = ctypes.c_long
@@ -130,8 +189,6 @@ class WindowsTaskbarProgress:
                 ]
 
             def guid(value):
-                import uuid
-
                 raw = uuid.UUID(value).bytes_le
                 result = GUID()
                 ctypes.memmove(
@@ -144,12 +201,20 @@ class WindowsTaskbarProgress:
             class ITaskbarList3:
                 def __init__(self, pointer):
                     self.pointer = pointer
+
                     vtable = ctypes.cast(
                         pointer,
                         ctypes.POINTER(
                             ctypes.POINTER(ctypes.c_void_p)
                         ),
                     ).contents
+
+                    self.QueryInterface = ctypes.WINFUNCTYPE(
+                        HRESULT,
+                        ctypes.c_void_p,
+                        ctypes.POINTER(GUID),
+                        ctypes.POINTER(ctypes.c_void_p),
+                    )(vtable[0])
 
                     self.Release = ctypes.WINFUNCTYPE(
                         ULONG,
@@ -176,93 +241,270 @@ class WindowsTaskbarProgress:
                         ctypes.c_int,
                     )(vtable[10])
 
-            CLSID_TaskbarList = guid(
+            clsid_taskbar_list = guid(
                 "56FDF344-FD6D-11D0-958A-006097C9A090"
             )
-            IID_ITaskbarList3 = guid(
-                "EA1AFB91-9E28-4B86-90E9-9E9F8A5EEA84"
+            iid_taskbar_list = guid(
+                "56FDF342-FD6D-11D0-958A-006097C9A090"
+            )
+            iid_taskbar_list3 = guid(
+                "EA1AFB91-9E28-4B86-90E9-9E9F8A5EEFAF"
             )
 
-            pointer = ctypes.c_void_p()
-            ole32 = ctypes.windll.ole32
-            ole32.CoInitialize(None)
+            base_pointer = ctypes.c_void_p()
+            taskbar3_pointer = ctypes.c_void_p()
 
-            result = ole32.CoCreateInstance(
-                ctypes.byref(CLSID_TaskbarList),
+            ole32 = ctypes.WinDLL("ole32")
+
+            ole32.CoInitializeEx.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+            ]
+            ole32.CoInitializeEx.restype = HRESULT
+
+            ole32.CoCreateInstance.argtypes = [
+                ctypes.POINTER(GUID),
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.POINTER(GUID),
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            ole32.CoCreateInstance.restype = HRESULT
+
+            # STA. S_OK and S_FALSE are both successful.
+            coinit_result = ole32.CoInitializeEx(None, 0x2)
+            rpc_e_changed_mode = -2147417850
+
+            if (
+                self._failed_hresult(coinit_result)
+                and int(coinit_result) != rpc_e_changed_mode
+            ):
+                self._last_error = (
+                    f"CoInitializeEx failed: {int(coinit_result)}"
+                )
+                print("[BeatFrame]", self._last_error)
+                return False
+
+            # Create the base interface first.
+            create_result = ole32.CoCreateInstance(
+                ctypes.byref(clsid_taskbar_list),
                 None,
-                1,
-                ctypes.byref(IID_ITaskbarList3),
-                ctypes.byref(pointer),
+                1,  # CLSCTX_INPROC_SERVER
+                ctypes.byref(iid_taskbar_list),
+                ctypes.byref(base_pointer),
             )
 
-            if result != 0 or not pointer.value:
-                return
+            if (
+                self._failed_hresult(create_result)
+                or not base_pointer.value
+            ):
+                self._last_error = (
+                    f"CoCreateInstance(ITaskbarList) failed: "
+                    f"{int(create_result)}"
+                )
+                print("[BeatFrame]", self._last_error)
+                return False
 
-            taskbar = ITaskbarList3(pointer)
-            if taskbar.HrInit(pointer) != 0:
-                taskbar.Release(pointer)
-                return
+            # IUnknown::QueryInterface is vtable slot 0.
+            base_vtable = ctypes.cast(
+                base_pointer,
+                ctypes.POINTER(
+                    ctypes.POINTER(ctypes.c_void_p)
+                ),
+            ).contents
+
+            query_interface = ctypes.WINFUNCTYPE(
+                HRESULT,
+                ctypes.c_void_p,
+                ctypes.POINTER(GUID),
+                ctypes.POINTER(ctypes.c_void_p),
+            )(base_vtable[0])
+
+            qi_result = query_interface(
+                base_pointer,
+                ctypes.byref(iid_taskbar_list3),
+                ctypes.byref(taskbar3_pointer),
+            )
+
+            if (
+                self._failed_hresult(qi_result)
+                or not taskbar3_pointer.value
+            ):
+                # Release the base object before returning.
+                base_release = ctypes.WINFUNCTYPE(
+                    ULONG,
+                    ctypes.c_void_p,
+                )(base_vtable[2])
+                base_release(base_pointer)
+
+                self._last_error = (
+                    f"QueryInterface(ITaskbarList3) failed: "
+                    f"{int(qi_result)}"
+                )
+                print("[BeatFrame]", self._last_error)
+                return False
+
+            taskbar = ITaskbarList3(taskbar3_pointer)
+
+            init_result = taskbar.HrInit(taskbar3_pointer)
+
+            if self._failed_hresult(init_result):
+                taskbar.Release(taskbar3_pointer)
+
+                base_release = ctypes.WINFUNCTYPE(
+                    ULONG,
+                    ctypes.c_void_p,
+                )(base_vtable[2])
+                base_release(base_pointer)
+
+                self._last_error = (
+                    f"HrInit failed: {int(init_result)}"
+                )
+                print("[BeatFrame]", self._last_error)
+                return False
+
+            hwnd = int(self._window.winId())
+
+            if not hwnd:
+                taskbar.Release(taskbar3_pointer)
+
+                base_release = ctypes.WINFUNCTYPE(
+                    ULONG,
+                    ctypes.c_void_p,
+                )(base_vtable[2])
+                base_release(base_pointer)
+
+                self._last_error = "Qt returned an invalid HWND"
+                print("[BeatFrame]", self._last_error)
+                return False
 
             self._taskbar = taskbar
-            self._pointer = pointer
+            self._pointer = taskbar3_pointer
+            self._base_pointer = base_pointer
+            self._initialized = True
+            self._last_error = None
 
-        except Exception:
+            print(
+                "[BeatFrame] Windows taskbar progress initialized "
+                f"(HWND={hwnd})"
+            )
+            return True
+
+        except Exception as error:
             self._taskbar = None
+            self._pointer = None
+            self._base_pointer = None
+            self._initialized = False
+            self._last_error = str(error)
+            print(
+                "[BeatFrame] Windows taskbar progress unavailable:",
+                error,
+            )
+            return False
 
     def _hwnd(self):
         return int(self._window.winId())
 
+    def _ensure_initialized(self):
+        if self._taskbar is not None:
+            return True
+        return self.initialize()
+
     def set_progress(self, percent: int):
-        if self._taskbar is None:
+        if not self._ensure_initialized():
             return
 
         try:
             percent = max(0, min(100, int(percent)))
-            self._taskbar.SetProgressState(
+
+            state_result = self._taskbar.SetProgressState(
                 self._pointer,
                 self._hwnd(),
                 self.TBPF_NORMAL,
             )
-            self._taskbar.SetProgressValue(
+            value_result = self._taskbar.SetProgressValue(
                 self._pointer,
                 self._hwnd(),
                 percent,
                 100,
             )
-        except Exception:
-            pass
+
+            if (
+                self._failed_hresult(state_result)
+                or self._failed_hresult(value_result)
+            ):
+                self._last_error = (
+                    "SetProgress failed: "
+                    f"state={int(state_result)}, "
+                    f"value={int(value_result)}"
+                )
+                print("[BeatFrame]", self._last_error)
+
+        except Exception as error:
+            self._last_error = str(error)
+            print(
+                "[BeatFrame] Taskbar progress error:",
+                error,
+            )
 
     def set_error(self):
-        if self._taskbar is None:
+        if not self._ensure_initialized():
             return
 
         try:
-            self._taskbar.SetProgressState(
+            state_result = self._taskbar.SetProgressState(
                 self._pointer,
                 self._hwnd(),
                 self.TBPF_ERROR,
             )
-            self._taskbar.SetProgressValue(
+            value_result = self._taskbar.SetProgressValue(
                 self._pointer,
                 self._hwnd(),
                 100,
                 100,
             )
-        except Exception:
-            pass
+
+            if (
+                self._failed_hresult(state_result)
+                or self._failed_hresult(value_result)
+            ):
+                self._last_error = (
+                    "SetError failed: "
+                    f"state={int(state_result)}, "
+                    f"value={int(value_result)}"
+                )
+                print("[BeatFrame]", self._last_error)
+
+        except Exception as error:
+            self._last_error = str(error)
+            print(
+                "[BeatFrame] Taskbar error-state error:",
+                error,
+            )
 
     def clear(self):
-        if self._taskbar is None:
+        if not self._ensure_initialized():
             return
 
         try:
-            self._taskbar.SetProgressState(
+            result = self._taskbar.SetProgressState(
                 self._pointer,
                 self._hwnd(),
                 self.TBPF_NOPROGRESS,
             )
-        except Exception:
-            pass
+
+            if self._failed_hresult(result):
+                self._last_error = (
+                    f"Clear taskbar progress failed: {int(result)}"
+                )
+                print("[BeatFrame]", self._last_error)
+
+        except Exception as error:
+            self._last_error = str(error)
+            print(
+                "[BeatFrame] Taskbar clear error:",
+                error,
+            )
 
 
 def apply_windows_dark_title_bar(window):
@@ -503,10 +745,20 @@ class ElidedLabel(QLabel):
 
 class ClickableLabel(QLabel):
     clicked = Signal()
+    hover_entered = Signal()
+    hover_left = Signal()
 
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
         self.setCursor(Qt.PointingHandCursor)
+
+    def enterEvent(self, event):
+        self.hover_entered.emit()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.hover_left.emit()
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -515,6 +767,104 @@ class ClickableLabel(QLabel):
             return
 
         super().mouseReleaseEvent(event)
+
+
+class PaintedIconButton(QPushButton):
+    """Small icon button with mathematically centered painted symbols."""
+
+    def __init__(self, icon_kind: str, parent=None):
+        super().__init__("", parent)
+        self.icon_kind = icon_kind
+        self.setCursor(Qt.PointingHandCursor)
+        self.setObjectName("paintedIconButton")
+
+    def paintEvent(self, event):
+        # Let Qt draw the styled button background/border first.
+        super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        center = QPointF(
+            self.width() / 2.0,
+            self.height() / 2.0,
+        )
+
+        color = (
+            QColor("#FFFFFF")
+            if self.underMouse()
+            else QColor("#AEB8D8")
+        )
+
+        if self.icon_kind == "close":
+            pen = QPen(
+                color,
+                1.7,
+                Qt.SolidLine,
+                Qt.RoundCap,
+            )
+            painter.setPen(pen)
+
+            half = 4.0
+            painter.drawLine(
+                QPointF(center.x() - half, center.y() - half),
+                QPointF(center.x() + half, center.y() + half),
+            )
+            painter.drawLine(
+                QPointF(center.x() + half, center.y() - half),
+                QPointF(center.x() - half, center.y() + half),
+            )
+            return
+
+        if self.icon_kind == "gear":
+            pen = QPen(
+                color,
+                1.55,
+                Qt.SolidLine,
+                Qt.RoundCap,
+                Qt.RoundJoin,
+            )
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+
+            import math
+
+            outer_radius = 7.0
+            inner_radius = 5.2
+            tooth_radius = 8.1
+
+            points = []
+            tooth_count = 8
+
+            for tooth in range(tooth_count):
+                base_angle = (
+                    -math.pi / 2
+                    + tooth * (2 * math.pi / tooth_count)
+                )
+
+                for offset, radius in (
+                    (-0.20, inner_radius),
+                    (-0.09, tooth_radius),
+                    (0.09, tooth_radius),
+                    (0.20, inner_radius),
+                ):
+                    angle = base_angle + offset
+                    points.append(
+                        QPointF(
+                            center.x() + math.cos(angle) * radius,
+                            center.y() + math.sin(angle) * radius,
+                        )
+                    )
+
+            path = QPainterPath()
+            if points:
+                path.moveTo(points[0])
+                for point in points[1:]:
+                    path.lineTo(point)
+                path.closeSubpath()
+
+            painter.drawPath(path)
+            painter.drawEllipse(center, 2.2, 2.2)
 
 
 class ToggleSwitch(QCheckBox):
@@ -589,6 +939,9 @@ class StatusGlow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+        self._hover_value = 0.0
+        self._hover_target = 0.0
+
         self.setFixedSize(112, 112)
         self.setAttribute(
             Qt.WA_TransparentForMouseEvents,
@@ -598,6 +951,33 @@ class StatusGlow(QWidget):
         blur = QGraphicsBlurEffect(self)
         blur.setBlurRadius(11)
         self.setGraphicsEffect(blur)
+
+        self.hover_timer = QTimer(self)
+        self.hover_timer.setInterval(16)
+        self.hover_timer.timeout.connect(
+            self._advance_hover
+        )
+
+    def set_hovered(self, hovered: bool):
+        self._hover_target = 1.0 if hovered else 0.0
+
+        if not self.hover_timer.isActive():
+            self.hover_timer.start()
+
+    def _advance_hover(self):
+        # Smooth ~180 ms ease toward the target.
+        difference = (
+            self._hover_target
+            - self._hover_value
+        )
+
+        if abs(difference) < 0.015:
+            self._hover_value = self._hover_target
+            self.hover_timer.stop()
+        else:
+            self._hover_value += difference * 0.22
+
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -613,11 +993,18 @@ class StatusGlow(QWidget):
             -18,
         )
 
+        hover = self._hover_value
+
+        # Hover strengthens the existing glow without changing its size.
+        violet_alpha = int(105 + (85 * hover))
+        blue_alpha = int(145 + (95 * hover))
+        magenta_alpha = int(135 + (95 * hover))
+
         # Soft violet base keeps the blue and magenta blended.
         painter.setPen(
             QPen(
-                QColor(132, 86, 255, 105),
-                3.4,
+                QColor(132, 86, 255, violet_alpha),
+                3.4 + (0.6 * hover),
                 Qt.SolidLine,
                 Qt.RoundCap,
             )
@@ -627,8 +1014,8 @@ class StatusGlow(QWidget):
         # Electric blue, weighted toward the lower-left.
         painter.setPen(
             QPen(
-                QColor(50, 100, 255, 145),
-                4.0,
+                QColor(50, 100, 255, blue_alpha),
+                4.0 + (0.7 * hover),
                 Qt.SolidLine,
                 Qt.RoundCap,
             )
@@ -642,8 +1029,8 @@ class StatusGlow(QWidget):
         # Magenta, weighted toward the upper-right.
         painter.setPen(
             QPen(
-                QColor(232, 72, 215, 135),
-                4.0,
+                QColor(232, 72, 215, magenta_alpha),
+                4.0 + (0.7 * hover),
                 Qt.SolidLine,
                 Qt.RoundCap,
             )
@@ -664,14 +1051,42 @@ class StatusIcon(QWidget):
         self._rotation = 0.0
         self._success_progress = 0.0
         self._success_rotation = 0.0
+        self._hover_value = 0.0
+        self._hover_target = 0.0
 
         self.setFixedSize(84, 84)
+
+        self.hover_timer = QTimer(self)
+        self.hover_timer.setInterval(16)
+        self.hover_timer.timeout.connect(
+            self._advance_hover
+        )
 
         self.animation_timer = QTimer(self)
         self.animation_timer.setInterval(16)
         self.animation_timer.timeout.connect(
             self._advance_animation
         )
+
+    def set_hovered(self, hovered: bool):
+        self._hover_target = 1.0 if hovered else 0.0
+
+        if not self.hover_timer.isActive():
+            self.hover_timer.start()
+
+    def _advance_hover(self):
+        difference = (
+            self._hover_target
+            - self._hover_value
+        )
+
+        if abs(difference) < 0.015:
+            self._hover_value = self._hover_target
+            self.hover_timer.stop()
+        else:
+            self._hover_value += difference * 0.22
+
+        self.update()
 
     def setText(self, text):
         self._text = text
@@ -948,9 +1363,17 @@ class StatusIcon(QWidget):
 
         # Draw + manually so it is mathematically centered.
         if self._text in ("＋", "+"):
+            hover = self._hover_value
+
+            symbol_color = QColor(
+                int(217 + (38 * hover)),
+                int(194 + (48 * hover)),
+                255,
+            )
+
             symbol_pen = QPen(
-                QColor("#D9C2FF"),
-                3.0,
+                symbol_color,
+                3.0 + (0.35 * hover),
                 Qt.SolidLine,
                 Qt.RoundCap,
             )
@@ -1318,6 +1741,7 @@ class RenderWorker(QObject):
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            creationflags=WINDOWS_SUBPROCESS_FLAGS,
         )
 
         self._current_process = process
@@ -1551,8 +1975,8 @@ class SettingsDialog(QDialog):
             True,
         )
 
-        if LOGO_PATH.exists():
-            self.setWindowIcon(QIcon(str(LOGO_PATH)))
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
 
         self.build_ui()
         self.load_settings()
@@ -1604,9 +2028,9 @@ class SettingsDialog(QDialog):
         title = QLabel("Settings")
         title.setObjectName("settingsTitle")
 
-        close_button = QPushButton("×")
+        close_button = PaintedIconButton("close")
         close_button.setObjectName("closeButton")
-        close_button.setFixedSize(34, 34)
+        close_button.setFixedSize(28, 28)
         close_button.clicked.connect(self.reject)
 
         title_row.addWidget(title)
@@ -1995,9 +2419,7 @@ class SettingsDialog(QDialog):
             QPushButton#closeButton {
                 background-color: rgba(255, 255, 255, 5);
                 border: 1px solid rgba(255, 255, 255, 22);
-                border-radius: 17px;
-                color: #AEB8D8;
-                font-size: 22px;
+                border-radius: 14px;
                 padding: 0px;
             }
 
@@ -2052,9 +2474,9 @@ class BeatFrame(QMainWindow):
         self.setMinimumSize(720, 540)
         self.setAcceptDrops(True)
 
-        if LOGO_PATH.exists():
+        if APP_ICON_PATH.exists():
             self.setWindowIcon(
-                QIcon(str(LOGO_PATH))
+                QIcon(str(APP_ICON_PATH))
             )
 
         self.settings = QSettings(
@@ -2085,6 +2507,22 @@ class BeatFrame(QMainWindow):
         self._position_success_toast()
 
         self.taskbar_progress = WindowsTaskbarProgress(self)
+        self._taskbar_init_scheduled = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+
+        # First show is when Qt/Windows has finalized the native top-level
+        # window. Bind ITaskbarList3 after that point.
+        if (
+            sys.platform == "win32"
+            and not self._taskbar_init_scheduled
+        ):
+            self._taskbar_init_scheduled = True
+            QTimer.singleShot(
+                0,
+                self.taskbar_progress.initialize,
+            )
 
     def build_ui(self):
         root = GradientBackground()
@@ -2143,7 +2581,7 @@ class BeatFrame(QMainWindow):
         header_text.addWidget(subtitle)
         header_text.addStretch()
 
-        self.settings_button = QPushButton("⚙")
+        self.settings_button = PaintedIconButton("gear")
         self.settings_button.setObjectName(
             "settingsButton"
         )
@@ -2233,6 +2671,18 @@ class BeatFrame(QMainWindow):
         )
         self.main_browse_plus.clicked.connect(
             self.browse_for_pair
+        )
+        self.main_browse_plus.hover_entered.connect(
+            lambda: self.status_glow.set_hovered(True)
+        )
+        self.main_browse_plus.hover_entered.connect(
+            lambda: self.status_icon.set_hovered(True)
+        )
+        self.main_browse_plus.hover_left.connect(
+            lambda: self.status_glow.set_hovered(False)
+        )
+        self.main_browse_plus.hover_left.connect(
+            lambda: self.status_icon.set_hovered(False)
         )
         self.main_browse_plus.raise_()
 
@@ -3523,12 +3973,13 @@ class BeatFrame(QMainWindow):
         self.error_action_button.hide()
 
 
+set_windows_app_user_model_id()
 app = QApplication(sys.argv)
 app.setApplicationName("BeatFrame")
 
-if LOGO_PATH.exists():
+if APP_ICON_PATH.exists():
     app.setWindowIcon(
-        QIcon(str(LOGO_PATH))
+        QIcon(str(APP_ICON_PATH))
     )
 
 window = BeatFrame()

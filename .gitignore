@@ -19,3 +19,10 @@ __pycache__/
 # Application assets
 !assets/
 !assets/**
+
+# PyInstaller
+build/
+dist/
+
+# Bundled local binaries
+bin/

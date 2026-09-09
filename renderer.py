@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import subprocess
+import sys
 import tempfile
 from typing import Callable, Optional
 
@@ -22,12 +23,57 @@ class RenderError(Exception):
     pass
 
 
+def get_tool_path(tool_name: str) -> str:
+    """
+    Resolve FFmpeg tools in both development and packaged builds.
+
+    Priority:
+    1. Bundled BeatFrame bin directory.
+    2. System PATH as a development fallback.
+    """
+    resource_dir = Path(
+        getattr(
+            sys,
+            "_MEIPASS",
+            Path(__file__).resolve().parent,
+        )
+    )
+
+    executable_name = (
+        f"{tool_name}.exe"
+        if sys.platform == "win32"
+        else tool_name
+    )
+
+    bundled_tool = (
+        resource_dir
+        / "bin"
+        / executable_name
+    )
+
+    if bundled_tool.exists():
+        return str(bundled_tool)
+
+    return tool_name
+
+
+FFMPEG = get_tool_path("ffmpeg")
+FFPROBE = get_tool_path("ffprobe")
+
+
+WINDOWS_SUBPROCESS_FLAGS = (
+    subprocess.CREATE_NO_WINDOW
+    if sys.platform == "win32"
+    else 0
+)
+
+
 def get_media_duration(
     media_path: str,
     media_type: str = "media",
 ) -> float:
     probe_command = [
-        "ffprobe",
+        FFPROBE,
         "-v", "quiet",
         "-print_format", "json",
         "-show_format",
@@ -40,6 +86,7 @@ def get_media_duration(
             capture_output=True,
             text=True,
             check=True,
+            creationflags=WINDOWS_SUBPROCESS_FLAGS,
         )
 
         data = json.loads(result.stdout)
@@ -71,7 +118,7 @@ def validate_image(
     image_path: str,
 ):
     probe_command = [
-        "ffprobe",
+        FFPROBE,
         "-v", "error",
         "-select_streams", "v:0",
         "-show_entries",
@@ -86,6 +133,7 @@ def validate_image(
             capture_output=True,
             text=True,
             check=True,
+            creationflags=WINDOWS_SUBPROCESS_FLAGS,
         )
 
         data = json.loads(result.stdout)
@@ -157,6 +205,7 @@ def run_ffmpeg_with_progress(
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        creationflags=WINDOWS_SUBPROCESS_FLAGS,
     )
 
     if process.stdout is None:
@@ -222,7 +271,7 @@ def encode_beat_audio(
     encoding path as the approved standalone audio test.
     """
     command = [
-        "ffmpeg",
+        FFMPEG,
         "-y",
         "-i", audio_path,
         "-vn",
@@ -238,6 +287,7 @@ def encode_beat_audio(
         command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=WINDOWS_SUBPROCESS_FLAGS,
     )
 
     if completed.returncode != 0:
@@ -267,7 +317,7 @@ def render_main_video(
     )
 
     command = [
-        "ffmpeg",
+        FFMPEG,
         "-y",
         "-loop", "1",
         "-framerate", "24000/1001",
@@ -307,7 +357,7 @@ def preprocess_artwork_1080p(
     This avoids repeating the same scale/pad work for every video frame.
     """
     command = [
-        "ffmpeg",
+        FFMPEG,
         "-y",
         "-i", image_path,
         "-vf",
@@ -325,6 +375,7 @@ def preprocess_artwork_1080p(
         command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=WINDOWS_SUBPROCESS_FLAGS,
     )
 
     if completed.returncode != 0:
@@ -341,7 +392,7 @@ def extract_intro_audio(
     Copy the intro's existing AAC audio stream without re-encoding it.
     """
     command = [
-        "ffmpeg",
+        FFMPEG,
         "-y",
         "-i", intro_path,
         "-vn",
@@ -353,6 +404,7 @@ def extract_intro_audio(
         command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=WINDOWS_SUBPROCESS_FLAGS,
     )
 
     if completed.returncode != 0:
@@ -384,7 +436,7 @@ def concatenate_audio_streams(
     )
 
     command = [
-        "ffmpeg",
+        FFMPEG,
         "-y",
         "-f", "concat",
         "-safe", "0",
@@ -397,6 +449,7 @@ def concatenate_audio_streams(
         command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=WINDOWS_SUBPROCESS_FLAGS,
     )
 
     if completed.returncode != 0:
@@ -456,7 +509,7 @@ def concatenate_intro(
     )
 
     command = [
-        "ffmpeg",
+        FFMPEG,
         "-y",
         "-i", intro_path,
         "-loop", "1",
