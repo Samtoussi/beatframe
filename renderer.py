@@ -211,9 +211,44 @@ def build_video_filter(
     )
 
 
+def encode_beat_audio(
+    audio_path: str,
+    output_path: str,
+):
+    """
+    Encode the source beat independently to the production AAC stream.
+
+    Keeping this encode separate from the intro preserves the same AAC
+    encoding path as the approved standalone audio test.
+    """
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i", audio_path,
+        "-vn",
+        "-c:a", "aac",
+        "-b:a", "384k",
+        "-aac_pns", "0",
+        "-ar", "48000",
+        "-ac", "2",
+        output_path,
+    ]
+
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if completed.returncode != 0:
+        raise RenderError(
+            "Beat audio couldn't be encoded."
+        )
+
+
 def render_main_video(
     image_path: str,
-    audio_path: str,
+    encoded_audio_path: str,
     output_path: str,
     fade_duration: float,
     audio_duration: float,
@@ -223,7 +258,8 @@ def render_main_video(
 ):
     """
     Final render when no intro is used.
-    The source audio is AAC-encoded exactly once.
+
+    The already-encoded production AAC stream is muxed without re-encoding.
     """
     video_filter = build_video_filter(
         fade_duration=fade_duration,
@@ -236,7 +272,7 @@ def render_main_video(
         "-loop", "1",
         "-framerate", "24000/1001",
         "-i", image_path,
-        "-i", audio_path,
+        "-i", encoded_audio_path,
         "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "medium",
@@ -244,11 +280,7 @@ def render_main_video(
         "-maxrate", "16M",
         "-bufsize", "32M",
         "-r", "24000/1001",
-        "-c:a", "aac",
-        "-b:a", "320k",
-        "-aac_pns", "0",
-        "-ar", "48000",
-        "-ac", "2",
+        "-c:a", "copy",
         "-pix_fmt", "yuv420p",
         "-t", str(audio_duration),
         "-shortest",
@@ -301,10 +333,82 @@ def preprocess_artwork_1080p(
         )
 
 
+def extract_intro_audio(
+    intro_path: str,
+    output_path: str,
+):
+    """
+    Copy the intro's existing AAC audio stream without re-encoding it.
+    """
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i", intro_path,
+        "-vn",
+        "-c:a", "copy",
+        output_path,
+    ]
+
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if completed.returncode != 0:
+        raise RenderError(
+            "Intro audio couldn't be extracted."
+        )
+
+
+def concatenate_audio_streams(
+    intro_audio_path: str,
+    beat_audio_path: str,
+    output_path: str,
+    concat_list_path: str,
+):
+    """
+    Concatenate intro AAC + independently encoded beat AAC using stream copy.
+    """
+    intro = Path(intro_audio_path).resolve().as_posix()
+    beat = Path(beat_audio_path).resolve().as_posix()
+
+    concat_contents = (
+        f"file '{intro}'\n"
+        f"file '{beat}'\n"
+    )
+
+    Path(concat_list_path).write_text(
+        concat_contents,
+        encoding="utf-8",
+    )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_list_path,
+        "-c", "copy",
+        output_path,
+    ]
+
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if completed.returncode != 0:
+        raise RenderError(
+            "Intro and beat audio couldn't be concatenated."
+        )
+
+
 def concatenate_intro(
     intro_path: str,
     image_path: str,
-    audio_path: str,
+    full_audio_path: str,
     audio_duration: float,
     output_path: str,
     fade_duration: float,
@@ -313,9 +417,8 @@ def concatenate_intro(
     ] = None,
 ):
     """
-    Render intro + normalized artwork + original beat audio in one pass.
-
-    The beat audio is AAC-encoded exactly once.
+    Render intro + normalized artwork video in one pass, then mux the
+    prebuilt intro + beat AAC track without any further audio encoding.
     """
     intro_duration = get_media_duration(
         intro_path,
@@ -323,7 +426,10 @@ def concatenate_intro(
     )
 
     total_duration = intro_duration + audio_duration
-    fade_out_start = max(0, audio_duration - fade_duration)
+    fade_out_start = max(
+        0,
+        audio_duration - fade_duration,
+    )
 
     filter_complex = (
         "[0:v]"
@@ -336,13 +442,6 @@ def concatenate_intro(
         "setpts=PTS-STARTPTS"
         "[v0];"
 
-        "[0:a]"
-        "aresample=48000,"
-        "aformat=sample_fmts=fltp:"
-        "channel_layouts=stereo,"
-        "asetpts=PTS-STARTPTS"
-        "[a0];"
-
         "[1:v]"
         f"fade=t=in:st=0:d={fade_duration},"
         f"fade=t=out:st={fade_out_start}:d={fade_duration},"
@@ -351,16 +450,9 @@ def concatenate_intro(
         "setpts=PTS-STARTPTS"
         "[v1];"
 
-        "[2:a]"
-        "aresample=48000,"
-        "aformat=sample_fmts=fltp:"
-        "channel_layouts=stereo,"
-        "asetpts=PTS-STARTPTS"
-        "[a1];"
-
-        "[v0][a0][v1][a1]"
-        "concat=n=2:v=1:a=1"
-        "[v][a]"
+        "[v0][v1]"
+        "concat=n=2:v=1:a=0"
+        "[v]"
     )
 
     command = [
@@ -371,20 +463,16 @@ def concatenate_intro(
         "-framerate", "24000/1001",
         "-t", str(audio_duration),
         "-i", image_path,
-        "-i", audio_path,
+        "-i", full_audio_path,
         "-filter_complex", filter_complex,
         "-map", "[v]",
-        "-map", "[a]",
+        "-map", "2:a:0",
         "-c:v", "libx264",
         "-preset", "medium",
         "-b:v", "16M",
         "-maxrate", "16M",
         "-bufsize", "32M",
-        "-c:a", "aac",
-        "-b:a", "320k",
-        "-aac_pns", "0",
-        "-ar", "48000",
-        "-ac", "2",
+        "-c:a", "copy",
         "-pix_fmt", "yuv420p",
         "-t", str(total_duration),
         "-movflags", "+faststart",
@@ -398,6 +486,7 @@ def concatenate_intro(
         duration=total_duration,
         progress_callback=progress_callback,
     )
+
 
 def render_video(
     image_path: str,
@@ -444,16 +533,24 @@ def render_video(
         normalized_artwork = (
             Path(temp_dir) / "artwork_1080p.png"
         )
+        encoded_beat_audio = (
+            Path(temp_dir) / "beat_audio.m4a"
+        )
 
         preprocess_artwork_1080p(
             image_path=image_path,
             output_path=str(normalized_artwork),
         )
 
+        encode_beat_audio(
+            audio_path=audio_path,
+            output_path=str(encoded_beat_audio),
+        )
+
         if not intro_path:
             render_main_video(
                 image_path=str(normalized_artwork),
-                audio_path=audio_path,
+                encoded_audio_path=str(encoded_beat_audio),
                 output_path=str(output_path),
                 fade_duration=fade_duration,
                 audio_duration=audio_duration,
@@ -467,10 +564,32 @@ def render_video(
                     f"Intro file not found: {intro}"
                 )
 
+            intro_audio = (
+                Path(temp_dir) / "intro_audio.m4a"
+            )
+            full_audio = (
+                Path(temp_dir) / "full_audio.m4a"
+            )
+            concat_list = (
+                Path(temp_dir) / "audio_concat.txt"
+            )
+
+            extract_intro_audio(
+                intro_path=str(intro),
+                output_path=str(intro_audio),
+            )
+
+            concatenate_audio_streams(
+                intro_audio_path=str(intro_audio),
+                beat_audio_path=str(encoded_beat_audio),
+                output_path=str(full_audio),
+                concat_list_path=str(concat_list),
+            )
+
             concatenate_intro(
                 intro_path=str(intro),
                 image_path=str(normalized_artwork),
-                audio_path=audio_path,
+                full_audio_path=str(full_audio),
                 audio_duration=audio_duration,
                 output_path=str(output_path),
                 fade_duration=fade_duration,
