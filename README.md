@@ -92,7 +92,11 @@ Each queued job keeps the settings that were active when it was added.
 
 ### Windows
 
-Windows builds are available from the **Releases** section of this repository.
+**[Download the latest version of BeatFrame](https://github.com/Samtoussi/beatframe/releases/latest)**
+
+Download `BeatFrame-v1.0.0-Setup.exe` from the latest release and run the installer.
+
+> **Note:** BeatFrame is currently unsigned. Windows may display a SmartScreen or Unknown Publisher warning during installation.
 
 > BeatFrame v1.0 currently targets Windows. macOS support is planned and will be published after the macOS build has been packaged and tested.
 
