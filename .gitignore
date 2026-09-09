@@ -26,3 +26,6 @@ dist/
 
 # Bundled local binaries
 bin/
+
+# Release installers
+*-Setup.exe
