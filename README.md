@@ -16,6 +16,18 @@
   <img src="assets/screenshot.png" alt="BeatFrame interface" width="850">
 </p>
 
+## Download
+
+### Windows
+
+### [⬇ Download BeatFrame for Windows](https://github.com/Samtoussi/beatframe/releases/latest/download/BeatFrame-v1.0.0-Setup.exe)
+
+Run the installer and start BeatFrame.
+
+> **Note:** BeatFrame is currently unsigned. Windows may display a SmartScreen or Unknown Publisher warning during installation.
+
+> BeatFrame v1.0 currently targets Windows. macOS support is planned and will be published after the macOS build has been packaged and tested.
+
 ---
 
 ## What is BeatFrame?
@@ -87,18 +99,6 @@ Need to render more than one beat?
 Drop additional artwork + audio pairs while a render is running and BeatFrame will add them to the queue automatically.
 
 Each queued job keeps the settings that were active when it was added.
-
-## Download
-
-### Windows
-
-**[Download the latest version of BeatFrame](https://github.com/Samtoussi/beatframe/releases/latest)**
-
-Download `BeatFrame-v1.0.0-Setup.exe` from the latest release and run the installer.
-
-> **Note:** BeatFrame is currently unsigned. Windows may display a SmartScreen or Unknown Publisher warning during installation.
-
-> BeatFrame v1.0 currently targets Windows. macOS support is planned and will be published after the macOS build has been packaged and tested.
 
 ## Build from source
 
@@ -199,7 +199,11 @@ Additional license and source information for bundled third-party components is 
 
 ## License
 
-BeatFrame licensing information will be provided with the v1.0 release.
+BeatFrame is free to use for personal and commercial content creation.
+
+See the [LICENSE](LICENSE) file for the full license terms.
+
+Third-party components, including FFmpeg, are distributed under their respective licenses. See [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) for details.
 
 ---
 
