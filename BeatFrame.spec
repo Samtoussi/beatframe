@@ -5,7 +5,12 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[('bin/ffmpeg.exe', 'bin'), ('bin/ffprobe.exe', 'bin')],
-    datas=[('assets', 'assets')],
+    datas=[
+    ('assets', 'assets'),
+    ('LICENSE', '.'),
+    ('THIRD_PARTY_NOTICES.txt', '.'),
+    ('GPL-3.0.txt', '.'),
+],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
